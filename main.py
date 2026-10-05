@@ -1,97 +1,140 @@
-from openai import OpenAI
-from dotenv import load_dotenv
-import os
+import sys
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+from rich.table import Table
+from rich.markdown import Markdown
 
-from tools.system_tools import (
-    open_notepad,
-    create_file,
-    list_files
-)
+from config.settings import settings
+from core.agent import JarvisAgent
+from core.llm_client import LLMClient
+from core.safety import SafetyEngine
+from tools.base import registry
 
-load_dotenv()
+# Register all capabilities
+import tools.system_info
+import tools.app_control
+import tools.file_ops
+import tools.system_ctl
+import tools.shell_runner
+import vision.capture
+import vision.grounding
+import vision.visual_diff
+import gui_driver.mouse_keyboard
+import gui_driver.navigator
 
-client = OpenAI(
-    api_key=os.environ.get("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
-)
+console = Console()
 
-SYSTEM_PROMPT = """
-You are a desktop AI assistant.
 
-Available tools:
-1. open_notepad()
-   Opens Notepad
+def display_welcome_banner():
+    banner_text = Text()
+    banner_text.append("J . A . R . V . I . S .\n", style="bold cyan")
+    banner_text.append("Just A Rather Very Intelligent System\n", style="italic white")
+    banner_text.append(f"Operating System: Linux (Session: {settings.WORKSPACE_DIR})\n", style="dim cyan")
+    banner_text.append(f"Active Provider: {settings.DEFAULT_PROVIDER.upper()} | Model: {settings.DEFAULT_MODEL}", style="dim green")
 
-2. create_file(filename)
-   Creates a new file
+    console.print(Panel(banner_text, border_style="cyan", expand=False))
 
-3. list_files()
-   Lists files in current directory
 
-When user asks for an action:
-Respond ONLY with this format:
+def display_tools_table():
+    table = Table(title="🔧 Active System Tools", border_style="cyan")
+    table.add_column("Tool Name", style="bold green")
+    table.add_column("Description", style="white")
 
-TOOL: tool_name: argument
+    for name, tool in registry.tools.items():
+        table.add_row(name, tool.description or "No description provided.")
 
-Examples:
-TOOL: open_notepad
-TOOL: create_file: notes.txt
+    console.print(table)
 
-If no tool needed, respond normally.
-"""
 
-messages=[
-    {
-        "role":"system",
-        "content":SYSTEM_PROMPT
-    }
-]
+def main():
+    display_welcome_banner()
 
-while True:
-    user = input("You: ")
+    llm = LLMClient()
+    if not llm.is_configured:
+        console.print(
+            Panel(
+                "[bold yellow]⚠️ No API Key Detected![/bold yellow]\n\n"
+                "To connect Jarvis to his neural backend, set [bold cyan]GROQ_API_KEY[/bold cyan] or [bold cyan]OPENAI_API_KEY[/bold cyan] in your [bold white].env[/bold white] file.\n"
+                "Example:\n"
+                "  [green]GROQ_API_KEY=gsk_your_groq_api_key_here[/green]\n\n"
+                "[dim](Commands available without API key: 'tools', 'status', 'exit')[/dim]",
+                border_style="yellow",
+                title="Configuration Required",
+            )
+        )
 
-    if("clear" in user or "exit" in user):
-        break
+    def on_thought(thought: str):
+        console.print(f"[dim italic cyan]⚡ {thought}[/dim italic cyan]")
 
-    messages.append({
-        "role":"user",
-        "content":user
-    })
+    def on_tool_call(name: str, args: dict):
+        console.print(f"[bold cyan]⚡ Calling Tool:[/bold cyan] [yellow]{name}[/yellow] [dim]args={args}[/dim]")
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=messages
+    def on_tool_result(name: str, output: any, success: bool):
+        status_symbol = "[bold green]✓[/bold green]" if success else "[bold red]✗[/bold red]"
+        console.print(f"  {status_symbol} [dim green]Result from {name}:[/dim green] [dim]{str(output)[:200]}...[/dim]")
+
+    def confirmation_prompt(tool_name: str, args: dict, reason: str) -> bool:
+        console.print(f"\n[bold red]⚠️ SAFETY CONFIRMATION REQUIRED[/bold red]")
+        console.print(f"  [yellow]Tool:[/yellow] {tool_name}")
+        console.print(f"  [yellow]Arguments:[/yellow] {args}")
+        console.print(f"  [yellow]Risk Assessment:[/yellow] {reason}")
+        try:
+            ans = console.input("[bold white]Authorise Jarvis to execute this action? (y/N): [/bold white]").strip().lower()
+            return ans in ("y", "yes")
+        except (KeyboardInterrupt, EOFError):
+            return False
+
+    safety = SafetyEngine(confirmation_handler=confirmation_prompt)
+
+    agent = JarvisAgent(
+        llm_client=llm,
+        tool_registry=registry,
+        safety_engine=safety,
+        on_thought=on_thought,
+        on_tool_call=on_tool_call,
+        on_tool_result=on_tool_result,
     )
-    
-    print(response)
+
+    console.print("\n[dim]Type your command below. Commands: 'exit' to quit, 'reset' to clear context, 'tools' to view tools, 'status' for telemetry.[/dim]\n")
+
+    while True:
+        try:
+            user_input = console.input(f"[bold green]{settings.USER_TITLE} > [/bold green]").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[cyan]Jarvis: Shutting down systems. Have a pleasant day, Sir.[/cyan]")
+            break
+
+        if not user_input:
+            continue
+
+        cmd = user_input.lower()
+        if cmd in ("exit", "quit", "bye"):
+            console.print("[cyan]Jarvis: Powering down core systems. Goodbye, Sir.[/cyan]")
+            break
+        elif cmd == "reset":
+            agent.reset()
+            console.print("[green]✓ Context buffer reset to baseline.[/green]")
+            continue
+        elif cmd == "tools":
+            display_tools_table()
+            continue
+        elif cmd == "status":
+            result = registry.execute("get_system_telemetry", {})
+            console.print(Panel(str(result.output), title="System Telemetry", border_style="cyan"))
+            continue
+
+        if not llm.is_configured:
+            console.print("[yellow]Jarvis: I am unable to process natural language queries until an API key is configured in your .env file, Sir.[/yellow]")
+            continue
+
+        with console.status("[bold cyan]Jarvis is processing...[/bold cyan]", spinner="dots"):
+            response = agent.step(user_input)
+
+        console.print(f"\n[bold cyan]{settings.ASSISTANT_NAME}:[/bold cyan]")
+        console.print(Markdown(response))
+        console.print()
 
 
-
-    ai_response = response.choices[0].message.content
-
-    print("AI: ", ai_response)
-
-    if ai_response.startswith("TOOL:"):
-        command = ai_response.replace("TOOL:","").strip()
-        
-        parts = command.split(":")
-
-        tool_name = parts[0].strip()
-        argument = None
-
-        if len(parts) > 1 :
-            argument = parts[1].strip()
-
-        if tool_name == "open_notepad":
-            open_notepad()
-        elif tool_name == "create_file":
-            create_file(argument)
-        elif tool_name == "list_files":
-            files = list_files()
-            print(f"Files: {files}")
-
-
-    messages.append({
-        "role":"assistant",
-        "content":ai_response
-    })
+if __name__ == "__main__":
+    main()
