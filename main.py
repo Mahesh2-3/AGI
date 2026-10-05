@@ -22,6 +22,11 @@ import vision.grounding
 import vision.visual_diff
 import gui_driver.mouse_keyboard
 import gui_driver.navigator
+import voice.speaker
+import voice.listener
+import voice.wake_word
+from voice.speaker import speaker
+from voice.listener import listener
 
 console = Console()
 
@@ -123,6 +128,24 @@ def main():
             result = registry.execute("get_system_telemetry", {})
             console.print(Panel(str(result.output), title="System Telemetry", border_style="cyan"))
             continue
+        is_voice = False
+        if cmd in ("voice", "listen"):
+            is_voice = True
+            console.print("[bold cyan]🎤 Jarvis Voice Mode Active[/bold cyan] [dim](Listening for 5 seconds...)[/dim]")
+            speaker.speak("Listening, Sir.", wait=True)
+            with console.status("[bold cyan]Listening to microphone...[/bold cyan]", spinner="arc"):
+                try:
+                    speech_text = listener.listen(duration_seconds=5.0)
+                except Exception as e:
+                    console.print(f"[red]Error recording speech: {e}[/red]")
+                    continue
+
+            if not speech_text:
+                console.print("[yellow]Jarvis: I didn't catch that, Sir.[/yellow]")
+                continue
+
+            console.print(f"[bold green]{settings.USER_TITLE} (Voice):[/bold green] [italic white]{speech_text}[/italic white]")
+            user_input = speech_text
 
         if not llm.is_configured:
             console.print("[yellow]Jarvis: I am unable to process natural language queries until an API key is configured in your .env file, Sir.[/yellow]")
@@ -134,6 +157,9 @@ def main():
         console.print(f"\n[bold cyan]{settings.ASSISTANT_NAME}:[/bold cyan]")
         console.print(Markdown(response))
         console.print()
+
+        if is_voice:
+            speaker.speak(response, wait=False)
 
 
 if __name__ == "__main__":

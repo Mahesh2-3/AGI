@@ -33,10 +33,11 @@ class SafetyEngine:
             "search_files", "grep_in_files", "list_open_windows", "list_running_processes",
             "get_audio_volume", "get_network_status", "open_path",
             "take_screenshot", "capture_window_screenshot", "locate_element",
-            "inspect_screen", "check_visual_difference"
+            "inspect_screen", "check_visual_difference",
+            "speak_message", "listen_to_user"
         )
         if tool_name in safe_tools:
-            return RiskTier.SAFE, "Read-only or visual inspection operation."
+            return RiskTier.SAFE, "Read-only, visual, or speech operation."
 
         if tool_name in ("execute_shell_command", "run_shell"):
             cmd = str(args.get("command", ""))

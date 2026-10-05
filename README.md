@@ -92,16 +92,15 @@ This project is broken down into structured, testable milestones so each capabil
 ---
 
 ### Phase 5: Voice Interface & Jarvis Persona (The "Voice")
-- [ ] **Step 5.1 — Wake-Word Engine**
-  - Continuous local listening for activation keyword ("Jarvis" / "Hey Jarvis") with zero cloud latency (`openWakeWord` or Porcupine).
-- [ ] **Step 5.2 — High-Speed Speech-to-Text (STT)**
-  - Fast transcription via local Whisper (`faster-whisper`) or Groq Whisper API (<300ms latency).
-  - Voice Activity Detection (VAD) using Silero VAD to detect when user finishes speaking.
-- [ ] **Step 5.3 — Jarvis Text-to-Speech (TTS) Engine**
-  - Crisp British speech synthesis (EdgeTTS British English male voice `en-GB-RyanNeural` or ElevenLabs custom clone).
-  - Streaming audio playback so Jarvis begins answering before the full response is generated.
-- [ ] **Step 5.4 — Barge-In / Interruption Handling**
-  - Allow the user to speak to immediately halt Jarvis's speech or stop ongoing actions.
+- [x] **Step 5.1 — Wake-Word Engine**
+  - Continuous local listening for activation keyword ("Jarvis" / "Hey Jarvis") with zero cloud latency.
+- [x] **Step 5.2 — High-Speed Speech-to-Text (STT)**
+  - Fast transcription via Groq Whisper Large v3 Turbo (<300ms latency) and PipeWire microphone recording.
+- [x] **Step 5.3 — Jarvis Text-to-Speech (TTS) Engine**
+  - Crisp British speech synthesis (EdgeTTS British English male voice `en-GB-RyanNeural`).
+  - Streaming audio playback so Jarvis begins answering immediately.
+- [x] **Step 5.4 — Barge-In / Interruption Handling**
+  - Instant speech cancellation and barge-in cut-off.
 
 ---
 
