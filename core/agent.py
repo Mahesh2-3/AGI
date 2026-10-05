@@ -4,6 +4,7 @@ from core.fast_path import FastPathRouter
 from core.llm_client import LLMClient
 from core.prompts import get_system_prompt
 from core.safety import SafetyEngine
+from core.workspace import workspace_manager
 from tools.base import ToolRegistry, ToolResult, registry as default_registry
 
 
@@ -71,6 +72,11 @@ class JarvisAgent:
 
         self.messages.append({"role": "user", "content": user_input})
 
+        # Initialize working workspace if not already established
+        if workspace_manager._working_workspace is None:
+            init_ws = workspace_manager.get_active_workspace()
+            workspace_manager.set_working_workspace(init_ws["id"])
+
         tools_schema = self.registry.get_schemas()
         iterations = 0
 
@@ -119,6 +125,14 @@ class JarvisAgent:
                     if not allowed:
                         result = ToolResult(success=False, output=None, error=reject_reason)
                     else:
+                        # Ensure Jarvis's working workspace is active on the monitor before interacting
+                        if fn_name in (
+                            "click_element", "type_into_element", "move_mouse", "click_mouse",
+                            "type_text_input", "press_shortcut", "scroll_page",
+                            "take_screenshot", "inspect_screen", "locate_element", "capture_window_screenshot"
+                        ):
+                            workspace_manager.ensure_working_workspace_active()
+
                         result = self.registry.execute(fn_name, args)
 
                     if self.on_tool_result:

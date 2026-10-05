@@ -60,8 +60,22 @@ def test_fast_path_in_agent_bypasses_llm():
     assert elapsed_ms < 50  # Must be sub-50ms (typically < 5ms)
 
 
+def test_fast_path_workspace_routing():
+    registry = ToolRegistry()
+
+    @registry.register(description="Make working workspace active")
+    def make_working_workspace_active() -> dict:
+        return {"was_active": False, "switched": True, "message": "Switched display to workspace 1"}
+
+    router = FastPathRouter(registry=registry)
+    res = router.route("if the jarvis working workspace is not the active one make the jarvis that workspace active")
+    assert res is not None
+    assert "Switched display to workspace 1" in res
+
+
 if __name__ == "__main__":
     test_fast_path_time_routing()
     test_fast_path_complex_query_falls_back()
     test_fast_path_in_agent_bypasses_llm()
+    test_fast_path_workspace_routing()
     print("✅ All fast path router tests passed successfully!")

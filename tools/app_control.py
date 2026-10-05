@@ -7,29 +7,39 @@ import time
 from typing import Any, Dict, List, Optional
 import psutil
 
+from core.workspace import workspace_manager
 from tools.base import registry
 
 
 def _is_hyprland() -> bool:
     """Checks if Hyprland is active and hyprctl is available."""
-    return bool(shutil.which("hyprctl")) and os.environ.get("XDG_CURRENT_DESKTOP") == "Hyprland"
+    return workspace_manager._is_hyprland()
 
 
 @registry.register(description="Returns the currently active desktop workspace ID and name (e.g. {'id': 1, 'name': '1'}).")
 def get_current_workspace() -> Dict[str, Any]:
     """Returns the ID and name of the currently active Hyprland workspace."""
-    if _is_hyprland():
-        try:
-            res = subprocess.run(["hyprctl", "activeworkspace", "-j"], capture_output=True, text=True, check=True)
-            data = json.loads(res.stdout)
-            return {"id": data.get("id", 1), "name": str(data.get("name", "1"))}
-        except Exception:
-            pass
-    return {"id": 1, "name": "1"}
+    return workspace_manager.get_active_workspace()
 
 
 def get_active_workspace() -> Dict[str, Any]:
-    return get_current_workspace()
+    return workspace_manager.get_active_workspace()
+
+
+@registry.register(description="If Jarvis's working workspace is not the active one on the screen, automatically switches to make it active.")
+def make_working_workspace_active() -> Dict[str, Any]:
+    return workspace_manager.ensure_working_workspace_active()
+
+
+@registry.register(description="Gets the workspace ID where Jarvis is currently working versus the monitor's active workspace.")
+def get_jarvis_workspace_status() -> Dict[str, Any]:
+    return workspace_manager.get_status()
+
+
+@registry.register(description="Sets the workspace ID where Jarvis should perform its tasks.")
+def set_jarvis_working_workspace(workspace_id: int) -> str:
+    workspace_manager.set_working_workspace(workspace_id)
+    return f"Jarvis working workspace set to {workspace_id}."
 
 
 @registry.register(description="Lists all currently open desktop windows with their titles, application classes, workspaces, and PIDs.")
@@ -202,11 +212,13 @@ def focus_window(query: str, bring_to_current_workspace: bool = False) -> str:
                     lua = f'for _, w in ipairs(hl.get_windows()) do if w.address == "{addr}" then hl.dispatch(hl.dsp.window.move({{ workspace = {active_id} }})); hl.dispatch(hl.dsp.focus({{ window = w }})); return "MOVED" end end return "FAIL"'
                     subprocess.run(["hyprctl", "repl", lua], capture_output=True, text=True)
                     time.sleep(0.15)
+                    workspace_manager.set_working_workspace(active_id)
                     return f"Moved '{win_title}' ({win_class}) from workspace {win_ws} to current workspace {active_id} and focused it."
                 else:
                     lua = f'for _, w in ipairs(hl.get_windows()) do if w.address == "{addr}" then if w.workspace and w.workspace.id then hl.dispatch(hl.dsp.focus({{ workspace = w.workspace.id }})) end; hl.dispatch(hl.dsp.focus({{ window = w }})); return "FOCUSED" end end return "FAIL"'
                     subprocess.run(["hyprctl", "repl", lua], capture_output=True, text=True)
                     time.sleep(0.15)
+                    workspace_manager.set_working_workspace(win_ws)
                     ws_msg = f"switched to workspace {win_ws} and " if win_ws != active_id else ""
                     return f"Successfully {ws_msg}focused '{win_title}' ({win_class})."
         except Exception:
@@ -234,13 +246,13 @@ def close_window(query: str) -> str:
 
 @registry.register(description="Switches the active desktop display viewport to a specific workspace number or name.")
 def switch_to_workspace(workspace_id: int) -> str:
-    if _is_hyprland():
+    if workspace_manager._is_hyprland():
         try:
-            lua = f'return hl.dispatch(hl.dsp.focus({{ workspace = {int(workspace_id)} }}))'
-            res = subprocess.run(["hyprctl", "repl", lua], capture_output=True, text=True)
-            if res.returncode == 0:
-                time.sleep(0.1)
+            ws_int = int(workspace_id)
+            if workspace_manager.switch_to_workspace(ws_int):
+                workspace_manager.set_working_workspace(ws_int)
                 return f"Successfully switched to workspace {workspace_id}."
+            return f"Failed to switch to workspace {workspace_id}."
         except Exception as e:
             return f"Failed to switch to workspace {workspace_id}: {e}"
     return "Workspace switching is not supported in this environment."

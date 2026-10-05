@@ -15,6 +15,7 @@ import pyautogui
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.02
 
+from core.workspace import workspace_manager
 from tools.base import registry
 
 
@@ -46,6 +47,7 @@ class MouseKeyboardController:
     @classmethod
     def move_to(cls, x: int, y: int, duration: float = 0.15) -> Dict[str, int]:
         """Moves cursor to target pixel coordinates with visual glide animation."""
+        workspace_manager.ensure_working_workspace_active()
         cur = cls.get_position()
         cur_x, cur_y = cur.get("x", x), cur.get("y", y)
 
@@ -130,6 +132,7 @@ class MouseKeyboardController:
 
     @classmethod
     def type_text(cls, text: str, press_enter: bool = False, interval: float = 0.01) -> str:
+        workspace_manager.ensure_working_workspace_active()
         try:
             import pynput
             kb = pynput.keyboard.Controller()
@@ -146,6 +149,7 @@ class MouseKeyboardController:
 
     @classmethod
     def hotkey(cls, keys: List[str] | str) -> str:
+        workspace_manager.ensure_working_workspace_active()
         if isinstance(keys, str):
             key_list = [k.strip().lower() for k in keys.split("+")]
         else:

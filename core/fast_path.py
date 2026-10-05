@@ -131,4 +131,31 @@ class FastPathRouter:
                     return f"Contents of `{target_path}` ({len(entries)} items):\n{preview}"
                 return f"Directory contents:\n{out}"
 
+        # 9. Workspace Activation & Synchronization
+        workspace_match = (
+            any(k in lower for k in ["jarvis working workspace", "working workspace", "jarvis workspace", "workspace of jarvis"])
+            and any(k in lower for k in ["active", "switch", "activate", "make", "focus", "ensure", "current"])
+        ) or any(k in lower for k in [
+            "make jarvis workspace active",
+            "switch to jarvis workspace",
+            "activate jarvis workspace",
+            "ensure working workspace active",
+        ])
+        if workspace_match:
+            res = self.registry.execute("make_working_workspace_active", {})
+            if res.success and isinstance(res.output, dict):
+                return f"{res.output.get('message', 'Workspace synchronized.')}, Sir."
+
+        # 10. VLM Availability Status
+        if any(phrase in lower for phrase in [
+            "vlm status",
+            "vision model status",
+            "vision models available",
+            "how many vision models",
+            "how many vlms",
+        ]):
+            res = self.registry.execute("get_vlm_status", {})
+            if res.success and isinstance(res.output, dict):
+                return f"Vision status report, Sir: {res.output.get('summary', 'operational')}."
+
         return None

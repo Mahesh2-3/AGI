@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 from PIL import Image
 
 from config.settings import settings
+from core.workspace import workspace_manager
 from tools.base import registry
 
 # High-speed in-memory RAM disk (/dev/shm) for zero disk I/O during visual perception loops
@@ -81,6 +82,8 @@ class ScreenCaptureEngine:
             output_path = Path(output_path).resolve()
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure Jarvis's working workspace is active on the monitor before capturing
+        workspace_manager.ensure_working_workspace_active()
         start_t = time.perf_counter()
 
         if self.has_grim:
@@ -129,6 +132,8 @@ class ScreenCaptureEngine:
             output_path = Path(output_path).resolve()
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure Jarvis's working workspace is active on the monitor before capturing
+        workspace_manager.ensure_working_workspace_active()
         start_t = time.perf_counter()
 
         if self.has_grim:
