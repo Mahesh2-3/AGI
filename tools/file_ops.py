@@ -146,3 +146,21 @@ def safe_delete_file(path: str) -> str:
 
     shutil.move(str(target), str(dest))
     return f"Moved '{target.name}' to trash at '{dest}'."
+
+
+@registry.register(description="Creates a new folder / directory at the specified path.")
+def create_directory(path: str) -> str:
+    dir_path = Path(path).resolve()
+    dir_path.mkdir(parents=True, exist_ok=True)
+    return f"Created directory '{dir_path.name}' at '{dir_path}'."
+
+
+@registry.register(description="Moves or renames a file or directory from source_path to destination_path.")
+def move_path(source_path: str, destination_path: str) -> str:
+    src = Path(source_path).resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"Source path not found: {source_path}")
+    dest = Path(destination_path).resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+    return f"Moved '{src.name}' to '{dest}'."

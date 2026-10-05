@@ -41,6 +41,20 @@ def test_file_operations_lifecycle(tmp_path):
     assert not test_file.exists()
     assert (tmp_path / ".trash" / "test_doc.txt").exists()
 
+    # Create directory and move file
+    sub_dir = tmp_path / "sub_vault"
+    mkdir_res = registry.execute("create_directory", {"path": str(sub_dir)})
+    assert mkdir_res.success is True
+    assert sub_dir.is_dir()
+
+    dummy_file = tmp_path / "dummy.txt"
+    registry.execute("write_file", {"path": str(dummy_file), "content": "Sample content"})
+    dest_file = sub_dir / "dummy_moved.txt"
+    move_res = registry.execute("move_path", {"source_path": str(dummy_file), "destination_path": str(dest_file)})
+    assert move_res.success is True
+    assert not dummy_file.exists()
+    assert dest_file.exists()
+
 
 if __name__ == "__main__":
     from tempfile import TemporaryDirectory
