@@ -11,16 +11,37 @@ from PIL import Image
 from config.settings import settings
 from tools.base import registry
 
-SCREENSHOTS_DIR = settings.WORKSPACE_DIR / "screenshots"
+# High-speed in-memory RAM disk (/dev/shm) for zero disk I/O during visual perception loops
+RAM_DISK_DIR = Path("/dev/shm/jarvis_screen") if Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK) else None
+PERSISTENT_SCREENSHOTS_DIR = settings.WORKSPACE_DIR / "screenshots"
 
 
 class ScreenCaptureEngine:
     """High-speed screen capture engine optimized for Linux Wayland & Hyprland."""
 
     def __init__(self):
-        self.screenshots_dir = SCREENSHOTS_DIR
-        self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+        self.persistent_dir = PERSISTENT_SCREENSHOTS_DIR
+        self.persistent_dir.mkdir(parents=True, exist_ok=True)
+        self.ram_dir = RAM_DISK_DIR
+        if self.ram_dir:
+            self.ram_dir.mkdir(parents=True, exist_ok=True)
+        self.screenshots_dir = self.ram_dir if self.ram_dir else self.persistent_dir
         self.has_grim = bool(shutil.which("grim"))
+
+    def _cleanup_old_ram_frames(self, max_frames: int = 20):
+        """Maintains low memory footprint on RAM disk by keeping only recent frames."""
+        if not self.ram_dir or not self.ram_dir.exists():
+            return
+        try:
+            frames = sorted(self.ram_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
+            if len(frames) > max_frames:
+                for f in frames[:-max_frames]:
+                    try:
+                        f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def get_display_geometry(self) -> Dict[str, Any]:
         """Queries monitor resolution and active workspace."""
@@ -47,11 +68,14 @@ class ScreenCaptureEngine:
         output_path: Optional[str | Path] = None,
         include_cursor: bool = False,
         quality: int = 80,
+        persistent: bool = False,
     ) -> Dict[str, Any]:
         """Captures full desktop screenshot."""
         if not output_path:
+            self._cleanup_old_ram_frames()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-            output_path = self.screenshots_dir / f"screen_{timestamp}.jpg"
+            target_dir = self.persistent_dir if persistent else self.screenshots_dir
+            output_path = target_dir / f"screen_{timestamp}.jpg"
         else:
             output_path = Path(output_path).resolve()
 
@@ -92,11 +116,14 @@ class ScreenCaptureEngine:
         height: int,
         output_path: Optional[str | Path] = None,
         quality: int = 80,
+        persistent: bool = False,
     ) -> Dict[str, Any]:
         """Captures a specific region of the screen (x, y, w, h)."""
         if not output_path:
+            self._cleanup_old_ram_frames()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-            output_path = self.screenshots_dir / f"region_{timestamp}.jpg"
+            target_dir = self.persistent_dir if persistent else self.screenshots_dir
+            output_path = target_dir / f"region_{timestamp}.jpg"
         else:
             output_path = Path(output_path).resolve()
 
