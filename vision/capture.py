@@ -58,10 +58,11 @@ class ScreenCaptureEngine:
                         "scale": primary.get("scale", 1.0),
                         "refresh_rate": primary.get("refreshRate"),
                         "active_workspace": primary.get("activeWorkspace", {}).get("name"),
+                        "active_workspace_id": primary.get("activeWorkspace", {}).get("id", 1),
                     }
             except Exception:
                 pass
-        return {"width": 1920, "height": 1080, "scale": 1.0}
+        return {"width": 1920, "height": 1080, "scale": 1.0, "active_workspace": "1", "active_workspace_id": 1}
 
     def capture_full_screen(
         self,
@@ -167,6 +168,22 @@ class ScreenCaptureEngine:
                     c_title = c.get("title", "").lower()
                     c_class = c.get("class", "").lower()
                     if query in c_title or query in c_class:
+                        # Auto-switch to window workspace if currently on another workspace
+                        c_ws = c.get("workspace", {}).get("id")
+                        if c_ws is not None:
+                            try:
+                                active_res = subprocess.run(["hyprctl", "activeworkspace", "-j"], capture_output=True, text=True)
+                                active_id = json.loads(active_res.stdout).get("id")
+                                if c_ws != active_id:
+                                    subprocess.run(
+                                        ["hyprctl", "repl", f"return hl.dispatch(hl.dsp.focus({{ workspace = {c_ws} }}))"],
+                                        capture_output=True,
+                                        text=True,
+                                    )
+                                    time.sleep(0.15)
+                            except Exception:
+                                pass
+
                         at = c.get("at", [0, 0])
                         size = c.get("size", [800, 600])
                         result = self.capture_region(
@@ -179,6 +196,7 @@ class ScreenCaptureEngine:
                         )
                         result["window_title"] = c.get("title")
                         result["window_class"] = c.get("class")
+                        result["workspace_id"] = c_ws
                         return result
             except Exception as e:
                 raise RuntimeError(f"Failed to query window geometry: {e}")

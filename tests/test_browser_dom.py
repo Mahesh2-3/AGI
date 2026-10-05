@@ -29,8 +29,9 @@ def test_browser_dom_navigation_and_extraction():
         assert "x" in first
         assert "y" in first
 
-        # Test click by text
-        click_res = browser_driver.click_element_by_text("Learn more")
+        # Test click by text using the actual extracted element's text
+        target_text = first["text"]
+        click_res = browser_driver.click_element_by_text(target_text)
         assert click_res["success"] is True
 
     finally:

@@ -56,7 +56,7 @@ class MouseKeyboardController:
                     inter_x = int(cur_x + (x - cur_x) * (i / steps))
                     inter_y = int(cur_y + (y - cur_y) * (i / steps))
                     subprocess.run(
-                        ["hyprctl", "eval", f"hl.dispatch(hl.dsp.cursor.move({{x={inter_x}, y={inter_y}}}))"],
+                        ["hyprctl", "dispatch", f"hl.dsp.cursor.move({{x={inter_x}, y={inter_y}}})"],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )

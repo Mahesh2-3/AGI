@@ -1,5 +1,6 @@
 from tools.base import registry
 import tools.app_control
+from tools.app_control import get_active_workspace, switch_to_workspace, move_window_to_workspace
 
 
 def test_app_control_tools_registered():
@@ -10,8 +11,12 @@ def test_app_control_tools_registered():
     assert "launch_application" in names
     assert "focus_window" in names
     assert "close_window" in names
+    assert "get_current_workspace" in names
+    assert "switch_to_workspace" in names
+    assert "move_window_to_workspace" in names
     assert "list_running_processes" in names
     assert "open_path" in names
+    assert "open_browser_url" in names
     assert "terminate_process" in names
 
 
@@ -19,6 +24,13 @@ def test_alias_resolution():
     from tools.app_control import resolve_application
     assert resolve_application("fileExplorer") == "dolphin"
     assert resolve_application("browser") in ("google-chrome", "firefox", "chromium", "brave", "zen-browser", "browser")
+
+
+def test_workspace_helpers():
+    active_ws = get_active_workspace()
+    assert isinstance(active_ws, dict)
+    assert "id" in active_ws
+    assert "name" in active_ws
 
 
 def test_list_open_windows():
@@ -37,6 +49,7 @@ def test_list_running_processes():
 if __name__ == "__main__":
     test_app_control_tools_registered()
     test_alias_resolution()
+    test_workspace_helpers()
     test_list_open_windows()
     test_list_running_processes()
     print("✅ All app control tests passed successfully!")

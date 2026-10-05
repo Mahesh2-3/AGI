@@ -123,7 +123,17 @@ class LLMClient:
                 return response
             except Exception as e:
                 last_exception = e
-                if self._is_rate_limit_error(e) and idx < len(cascade) - 1:
+                err_lower = str(e).lower()
+                is_recoverable = (
+                    self._is_rate_limit_error(e)
+                    or "tool_use_failed" in err_lower
+                    or "tool choice is none" in err_lower
+                    or "failed_generation" in err_lower
+                    or "output_parse_failed" in err_lower
+                    or "503" in err_lower
+                    or "500" in err_lower
+                )
+                if is_recoverable and idx < len(cascade) - 1:
                     now_ts = time.time()
                     self._model_cooldowns[candidate_model] = now_ts + 120.0
                     next_model = cascade[idx + 1]
@@ -133,7 +143,7 @@ class LLMClient:
                     if now_ts - self._last_fallback_alert.get(pair_key, 0.0) > 15.0:
                         self._last_fallback_alert[pair_key] = now_ts
                         logger.warning(
-                            f"Rate limit on {candidate_model}. Cascading failover to {next_model}."
+                            f"Model issue on {candidate_model} ({e}). Cascading failover to {next_model}."
                         )
                         if self.on_fallback:
                             self.on_fallback(candidate_model, next_model, str(e))
@@ -144,7 +154,7 @@ class LLMClient:
                     wait_s = float(retry_match.group(1)) if retry_match else 1.2
                     time.sleep(min(2.5, wait_s))
                     continue
-                # If it's not a rate limit error or we have exhausted candidates, raise
+                # If it's not recoverable or we have exhausted candidates, raise
                 raise e
 
         if last_exception:
