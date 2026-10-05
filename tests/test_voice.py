@@ -34,8 +34,18 @@ def test_speaker_interruption():
     assert speaker._current_process is None
 
 
+def test_vad_recording():
+    import os
+    from voice.listener import listener
+    output = listener.record_microphone_vad(max_duration_seconds=1.5, max_initial_wait_seconds=0.5)
+    assert os.path.exists(output)
+    assert os.path.getsize(output) >= 44  # Valid WAV header
+    os.remove(output)
+
+
 if __name__ == "__main__":
     test_voice_tools_registered()
     test_wake_word_parsing()
     test_speaker_interruption()
+    test_vad_recording()
     print("✅ All voice subsystem tests passed successfully!")
