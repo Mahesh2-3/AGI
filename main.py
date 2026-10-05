@@ -101,7 +101,12 @@ def main():
         on_tool_result=on_tool_result,
     )
 
-    console.print("\n[dim]Type your command below. Commands: 'exit' to quit, 'reset' to clear context, 'tools' to view tools, 'status' for telemetry.[/dim]\n")
+    # Hook model fallback notifications into terminal UI
+    llm.on_fallback = lambda old_m, new_m, reason: console.print(
+        f"\n[bold yellow]⚠️ Rate limit reached for {old_m}. Automatically cascading to {new_m}...[/bold yellow]"
+    )
+
+    console.print("\n[dim]Type your command below. Commands: 'exit' to quit, 'reset' to clear context, 'tools' to view tools, 'status' for telemetry, 'voice' to speak.[/dim]\n")
 
     while True:
         try:
@@ -128,14 +133,15 @@ def main():
             result = registry.execute("get_system_telemetry", {})
             console.print(Panel(str(result.output), title="System Telemetry", border_style="cyan"))
             continue
+
         is_voice = False
         if cmd in ("voice", "listen"):
             is_voice = True
-            console.print("[bold cyan]🎤 Jarvis Voice Mode Active[/bold cyan] [dim](Listening for 5 seconds...)[/dim]")
+            console.print("[bold cyan]🎤 Jarvis Voice Mode Active[/bold cyan] [dim](Listening with real-time VAD...)[/dim]")
             speaker.speak("Listening, Sir.", wait=True)
-            with console.status("[bold cyan]Listening to microphone...[/bold cyan]", spinner="arc"):
+            with console.status("[bold cyan]Listening to microphone (speak now)...[/bold cyan]", spinner="arc"):
                 try:
-                    speech_text = listener.listen(duration_seconds=5.0)
+                    speech_text = listener.listen(duration_seconds=8.0, use_vad=True)
                 except Exception as e:
                     console.print(f"[red]Error recording speech: {e}[/red]")
                     continue
@@ -146,10 +152,6 @@ def main():
 
             console.print(f"[bold green]{settings.USER_TITLE} (Voice):[/bold green] [italic white]{speech_text}[/italic white]")
             user_input = speech_text
-
-        if not llm.is_configured:
-            console.print("[yellow]Jarvis: I am unable to process natural language queries until an API key is configured in your .env file, Sir.[/yellow]")
-            continue
 
         with console.status("[bold cyan]Jarvis is processing...[/bold cyan]", spinner="dots"):
             response = agent.step(user_input)
