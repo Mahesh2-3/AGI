@@ -17,6 +17,7 @@ import tools.app_control
 import tools.file_ops
 import tools.system_ctl
 import tools.shell_runner
+import tools.browser_dom
 import vision.capture
 import vision.grounding
 import vision.visual_diff
