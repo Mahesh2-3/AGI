@@ -47,7 +47,33 @@ def test_llm_client_non_rate_limit_error_not_swallowed():
         assert "Invalid argument" in str(e)
 
 
+def test_llm_client_cooldown():
+    client = LLMClient(provider="groq")
+    mock_sdk = MagicMock()
+    client._client = mock_sdk
+
+    # Call 1: model 1 fails, model 2 succeeds
+    call1_err = MockRateLimitError()
+    call1_ok = MagicMock(choices=[MagicMock(message=MagicMock(content="Success 1"))])
+    # Call 2: should directly call model 2 without retrying model 1
+    call2_ok = MagicMock(choices=[MagicMock(message=MagicMock(content="Success 2"))])
+
+    mock_sdk.chat.completions.create.side_effect = [call1_err, call1_ok, call2_ok]
+
+    client.chat(messages=[{"role": "user", "content": "1"}])
+    # Verify cooldown was recorded
+    assert client.model_cascade[0] in client._model_cooldowns
+
+    # Second chat call should use model 2 directly
+    res2 = client.chat(messages=[{"role": "user", "content": "2"}])
+    assert res2.choices[0].message.content == "Success 2"
+    # Ensure call 2 requested model_cascade[1]
+    last_call_kwargs = mock_sdk.chat.completions.create.call_args_list[-1].kwargs
+    assert last_call_kwargs["model"] == client.model_cascade[1]
+
+
 if __name__ == "__main__":
     test_llm_client_rate_limit_cascading()
     test_llm_client_non_rate_limit_error_not_swallowed()
+    test_llm_client_cooldown()
     print("✅ All LLM cascade tests passed successfully!")

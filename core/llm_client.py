@@ -30,11 +30,29 @@ class LLMClient:
         self._client = None
         self._init_client()
 
+        # Cooldown tracker: model_name -> expiry timestamp
+        self._model_cooldowns: Dict[str, float] = {}
+
         # Build cascade list ensuring primary model is first
         if self.provider == "groq":
             self.model_cascade = [self.model] + [m for m in GROQ_CASCADE_MODELS if m != self.model]
         else:
             self.model_cascade = [self.model]
+
+    def _get_active_cascade(self) -> List[str]:
+        """Returns candidate models with cooled-down models prioritized."""
+        import time
+        now = time.time()
+        ready = []
+        cooling = []
+        for m in self.model_cascade:
+            cooldown_until = self._model_cooldowns.get(m, 0.0)
+            if now >= cooldown_until:
+                ready.append(m)
+            else:
+                cooling.append(m)
+        # Try ready models first, then cooling models as backup
+        return ready if ready else cooling
 
     def _init_client(self):
         if self.provider == "groq":
@@ -87,8 +105,10 @@ class LLMClient:
             )
 
         last_exception = None
+        import time
+        cascade = self._get_active_cascade()
 
-        for idx, candidate_model in enumerate(self.model_cascade):
+        for idx, candidate_model in enumerate(cascade):
             kwargs: Dict[str, Any] = {
                 "model": candidate_model,
                 "messages": messages,
@@ -104,8 +124,9 @@ class LLMClient:
                 return response
             except Exception as e:
                 last_exception = e
-                if self._is_rate_limit_error(e) and idx < len(self.model_cascade) - 1:
-                    next_model = self.model_cascade[idx + 1]
+                if self._is_rate_limit_error(e) and idx < len(cascade) - 1:
+                    self._model_cooldowns[candidate_model] = time.time() + 60.0
+                    next_model = cascade[idx + 1]
                     logger.warning(
                         f"Rate limit encountered on {candidate_model}. Cascading failover to {next_model}."
                     )
@@ -132,8 +153,10 @@ class LLMClient:
             )
 
         last_exception = None
+        import time
+        cascade = self._get_active_cascade()
 
-        for idx, candidate_model in enumerate(self.model_cascade):
+        for idx, candidate_model in enumerate(cascade):
             kwargs: Dict[str, Any] = {
                 "model": candidate_model,
                 "messages": messages,
@@ -152,8 +175,9 @@ class LLMClient:
                 return
             except Exception as e:
                 last_exception = e
-                if self._is_rate_limit_error(e) and idx < len(self.model_cascade) - 1:
-                    next_model = self.model_cascade[idx + 1]
+                if self._is_rate_limit_error(e) and idx < len(cascade) - 1:
+                    self._model_cooldowns[candidate_model] = time.time() + 60.0
+                    next_model = cascade[idx + 1]
                     logger.warning(
                         f"Rate limit encountered on {candidate_model}. Cascading failover stream to {next_model}."
                     )
