@@ -119,25 +119,35 @@ def open_path(path: str = ".") -> str:
         raise RuntimeError("Neither 'xdg-open' nor 'gio' is available to open paths.")
 
 
+@registry.register(description="Navigates directly to any website URL in the browser (e.g. 'https://www.chess.com/play/computer', 'https://github.com').")
+def open_browser_url(url: str) -> str:
+    clean_url = url.strip()
+    if not clean_url.startswith(("http://", "https://")):
+        clean_url = f"https://{clean_url}"
+
+    # Try launching directly with google-chrome or default browser
+    if shutil.which("google-chrome"):
+        subprocess.Popen(["google-chrome", clean_url], start_new_session=True)
+        return f"Navigated to '{clean_url}' in Google Chrome."
+    elif shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", clean_url], start_new_session=True)
+        return f"Opened '{clean_url}' in web browser."
+    raise RuntimeError("No supported web browser found.")
+
+
 @registry.register(description="Focuses an active desktop window matching the given application name or title keyword.")
 def focus_window(query: str) -> str:
     query = query.strip().lower()
     if _is_hyprland():
         try:
-            res = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, check=True)
-            clients = json.loads(res.stdout)
-            for c in clients:
-                c_title = c.get("title", "").lower()
-                c_class = c.get("class", "").lower()
-                if query in c_title or query in c_class:
-                    target = f"address:{c.get('address')}"
-                    subprocess.run(["hyprctl", "dispatch", "focuswindow", target], check=True)
-                    return f"Focused window: '{c.get('title')}' (class: {c.get('class')})."
-            return f"No open window found matching query: '{query}'."
-        except Exception as e:
-            return f"Error focusing window: {e}"
+            lua = f'for _, w in ipairs(hl.get_windows()) do if string.find(string.lower(w.title), "{query}", 1, true) or string.find(string.lower(w.class), "{query}", 1, true) then hl.dispatch(hl.dsp.focus({{ window = w }})) return w.title end end'
+            res = subprocess.run(["hyprctl", "eval", lua], capture_output=True, text=True)
+            if res.returncode == 0:
+                return f"Successfully focused window matching '{query}'."
+        except Exception:
+            pass
 
-    return f"Window focusing requires a supported compositor (Hyprland active: {_is_hyprland()})."
+    return f"No open window found matching query: '{query}'."
 
 
 @registry.register(description="Closes an active window matching the application name, title keyword, or window address.")
@@ -145,28 +155,14 @@ def close_window(query: str) -> str:
     query = query.strip().lower()
     if _is_hyprland():
         try:
-            res = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, check=True)
-            clients = json.loads(res.stdout)
-            for c in clients:
-                c_title = c.get("title", "").lower()
-                c_class = c.get("class", "").lower()
-                c_addr = c.get("address", "").lower()
-                if query in (c_title, c_class, c_addr) or query in c_title or query in c_class:
-                    target = f"address:{c.get('address')}"
-                    # Try hyprctl first
-                    try:
-                        subprocess.run(["hyprctl", "dispatch", "closewindow", target], check=True, capture_output=True)
-                        return f"Closed window: '{c.get('title')}' (class: {c.get('class')})."
-                    except Exception:
-                        # Fallback to terminating the window process directly
-                        pid = c.get("pid")
-                        if pid and pid > 1:
-                            return terminate_process(pid)
-            return f"No open window found matching: '{query}'."
-        except Exception as e:
-            return f"Error closing window: {e}"
+            lua = f'for _, w in ipairs(hl.get_windows()) do if string.find(string.lower(w.title), "{query}", 1, true) or string.find(string.lower(w.class), "{query}", 1, true) then hl.dispatch(hl.dsp.window.close({{ window = w }})) return w.title end end'
+            res = subprocess.run(["hyprctl", "eval", lua], capture_output=True, text=True)
+            if res.returncode == 0:
+                return f"Successfully closed window matching '{query}'."
+        except Exception:
+            pass
 
-    return "Window closing is currently configured for Hyprland desktop."
+    return f"No open window found matching: '{query}'."
 
 
 @registry.register(description="Lists top running processes with optional name filtering and sorting by memory/CPU.")

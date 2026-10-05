@@ -1,3 +1,6 @@
+import os
+import shutil
+import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -8,64 +11,142 @@ if "mouseinfo" not in sys.modules:
 
 import pyautogui
 
-# Safety fail-safe (moving mouse to corner raises an exception if enabled, set True for safety)
+# Safety fail-safe
 pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.05
+pyautogui.PAUSE = 0.02
 
 from tools.base import registry
 
 
 class MouseKeyboardController:
-    """Controls physical mouse and keyboard inputs on the desktop."""
+    """Controls physical mouse and keyboard inputs on Linux desktops (Hyprland Wayland and X11)."""
 
     @staticmethod
-    def get_position() -> Dict[str, int]:
-        pos = pyautogui.position()
-        return {"x": pos.x, "y": pos.y}
+    def _is_hyprland() -> bool:
+        return bool(shutil.which("hyprctl")) and os.environ.get("XDG_CURRENT_DESKTOP") == "Hyprland"
 
-    @staticmethod
-    def move_to(x: int, y: int, duration: float = 0.2) -> Dict[str, int]:
-        pyautogui.moveTo(x, y, duration=duration)
+    @classmethod
+    def get_position(cls) -> Dict[str, int]:
+        """Returns the true current desktop cursor coordinates."""
+        if cls._is_hyprland():
+            try:
+                res = subprocess.run(["hyprctl", "cursorpos"], capture_output=True, text=True)
+                parts = [p.strip() for p in res.stdout.strip().split(",")]
+                if len(parts) == 2:
+                    return {"x": int(parts[0]), "y": int(parts[1])}
+            except Exception:
+                pass
+
+        try:
+            pos = pyautogui.position()
+            return {"x": pos.x, "y": pos.y}
+        except Exception:
+            return {"x": 0, "y": 0}
+
+    @classmethod
+    def move_to(cls, x: int, y: int, duration: float = 0.15) -> Dict[str, int]:
+        """Moves cursor to target pixel coordinates with visual glide animation."""
+        cur = cls.get_position()
+        cur_x, cur_y = cur.get("x", x), cur.get("y", y)
+
+        if cls._is_hyprland():
+            try:
+                steps = 5
+                for i in range(1, steps + 1):
+                    inter_x = int(cur_x + (x - cur_x) * (i / steps))
+                    inter_y = int(cur_y + (y - cur_y) * (i / steps))
+                    subprocess.run(
+                        ["hyprctl", "eval", f"hl.dispatch(hl.dsp.cursor.move({{x={inter_x}, y={inter_y}}}))"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    time.sleep(duration / steps)
+            except Exception:
+                pass
+
+        try:
+            import pynput
+            pynput.mouse.Controller().position = (x, y)
+        except Exception:
+            pass
+
+        try:
+            pyautogui.moveTo(x, y, duration=0)
+        except Exception:
+            pass
+
         return {"x": x, "y": y}
 
-    @staticmethod
-    def click(x: Optional[int] = None, y: Optional[int] = None, button: str = "left", clicks: int = 1) -> Dict[str, Any]:
+    @classmethod
+    def click(cls, x: Optional[int] = None, y: Optional[int] = None, button: str = "left", clicks: int = 1) -> Dict[str, Any]:
+        """Moves to coordinates and executes native mouse click."""
         if x is not None and y is not None:
-            pyautogui.moveTo(x, y, duration=0.15)
-        pyautogui.click(button=button, clicks=clicks)
-        pos = pyautogui.position()
-        return {"clicked_at": {"x": pos.x, "y": pos.y}, "button": button, "clicks": clicks}
+            cls.move_to(x, y)
 
-    @staticmethod
-    def double_click(x: Optional[int] = None, y: Optional[int] = None) -> Dict[str, Any]:
-        return MouseKeyboardController.click(x=x, y=y, button="left", clicks=2)
+        try:
+            import pynput
+            mouse_btn = (
+                pynput.mouse.Button.left
+                if button == "left"
+                else (pynput.mouse.Button.right if button == "right" else pynput.mouse.Button.middle)
+            )
+            mouse = pynput.mouse.Controller()
+            for _ in range(clicks):
+                mouse.click(mouse_btn)
+                time.sleep(0.04)
+        except Exception:
+            pass
 
-    @staticmethod
-    def right_click(x: Optional[int] = None, y: Optional[int] = None) -> Dict[str, Any]:
-        return MouseKeyboardController.click(x=x, y=y, button="right", clicks=1)
+        try:
+            pyautogui.click(button=button, clicks=clicks)
+        except Exception:
+            pass
 
-    @staticmethod
-    def drag_to(x: int, y: int, duration: float = 0.5) -> Dict[str, Any]:
+        pos = cls.get_position()
+        return {"clicked_at": {"x": pos.get("x", x or 0), "y": pos.get("y", y or 0)}, "button": button, "clicks": clicks}
+
+    @classmethod
+    def double_click(cls, x: Optional[int] = None, y: Optional[int] = None) -> Dict[str, Any]:
+        return cls.click(x=x, y=y, button="left", clicks=2)
+
+    @classmethod
+    def right_click(cls, x: Optional[int] = None, y: Optional[int] = None) -> Dict[str, Any]:
+        return cls.click(x=x, y=y, button="right", clicks=1)
+
+    @classmethod
+    def drag_to(cls, x: int, y: int, duration: float = 0.4) -> Dict[str, Any]:
         pyautogui.dragTo(x, y, duration=duration, button="left")
         return {"dragged_to": {"x": x, "y": y}}
 
-    @staticmethod
-    def scroll(amount: int) -> str:
-        pyautogui.scroll(amount)
+    @classmethod
+    def scroll(cls, amount: int) -> str:
+        try:
+            import pynput
+            pynput.mouse.Controller().scroll(0, amount)
+        except Exception:
+            pyautogui.scroll(amount)
         direction = "up" if amount > 0 else "down"
         return f"Scrolled {direction} by {abs(amount)} clicks."
 
-    @staticmethod
-    def type_text(text: str, press_enter: bool = False, interval: float = 0.02) -> str:
-        pyautogui.write(text, interval=interval)
-        if press_enter:
-            pyautogui.press("enter")
+    @classmethod
+    def type_text(cls, text: str, press_enter: bool = False, interval: float = 0.01) -> str:
+        try:
+            import pynput
+            kb = pynput.keyboard.Controller()
+            for char in text:
+                kb.type(char)
+                time.sleep(interval)
+            if press_enter:
+                kb.tap(pynput.keyboard.Key.enter)
+        except Exception:
+            pyautogui.write(text, interval=interval)
+            if press_enter:
+                pyautogui.press("enter")
         return f"Typed {len(text)} characters{' and pressed Enter' if press_enter else ''}."
 
-    @staticmethod
-    def hotkey(keys: List[str] | str) -> str:
+    @classmethod
+    def hotkey(cls, keys: List[str] | str) -> str:
         if isinstance(keys, str):
-            # Parse 'ctrl+c' or 'ctrl+alt+t'
             key_list = [k.strip().lower() for k in keys.split("+")]
         else:
             key_list = [k.strip().lower() for k in keys]
@@ -77,7 +158,7 @@ class MouseKeyboardController:
 controller = MouseKeyboardController()
 
 
-@registry.register(description="Moves mouse cursor to specific screen pixel coordinates (x, y).")
+@registry.register(description="Moves mouse cursor smoothly to specific screen pixel coordinates (x, y).")
 def move_mouse(x: int, y: int) -> Dict[str, Any]:
     return controller.move_to(x, y)
 

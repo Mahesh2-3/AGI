@@ -79,3 +79,11 @@ def get_network_status() -> Dict[str, Any]:
             pass
 
     return status
+
+
+@registry.register(description="Pauses execution safely for a specified duration in seconds (0.1 to 15.0s) to allow applications to launch or webpages to load.")
+def wait_seconds(seconds: float = 2.0) -> str:
+    import time
+    clamped = max(0.1, min(15.0, float(seconds)))
+    time.sleep(clamped)
+    return f"Waited {clamped:.1f} seconds for interface to settle."
