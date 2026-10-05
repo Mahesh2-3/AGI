@@ -43,9 +43,19 @@ def test_vad_recording():
     os.remove(output)
 
 
+def test_speaker_sentence_splitting():
+    text = "Certainly, Sir! All systems are operational. Shall I run diagnostics?"
+    sentences = speaker._split_into_sentences(text)
+    assert len(sentences) == 3
+    assert sentences[0] == "Certainly, Sir!"
+    assert sentences[1] == "All systems are operational."
+    assert sentences[2] == "Shall I run diagnostics?"
+
+
 if __name__ == "__main__":
     test_voice_tools_registered()
     test_wake_word_parsing()
     test_speaker_interruption()
     test_vad_recording()
+    test_speaker_sentence_splitting()
     print("✅ All voice subsystem tests passed successfully!")
