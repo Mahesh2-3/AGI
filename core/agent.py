@@ -42,6 +42,23 @@ class JarvisAgent:
             {"role": "system", "content": get_system_prompt()}
         ]
 
+    def _prune_context(self, max_recent: int = 8) -> List[Dict[str, Any]]:
+        """Maintains a slim context window to prevent exceeding Groq TPM (Tokens Per Minute) limits."""
+        if len(self.messages) <= max_recent + 2:
+            return self.messages
+
+        system_msg = self.messages[0]
+        initial_user = self.messages[1] if len(self.messages) > 1 and self.messages[1].get("role") == "user" else None
+
+        tail = self.messages[-max_recent:]
+        pruned = [system_msg]
+        if initial_user and initial_user not in tail:
+            pruned.append(initial_user)
+        for m in tail:
+            if m != system_msg and m != initial_user:
+                pruned.append(m)
+        return pruned
+
     def step(self, user_input: str) -> str:
         """Processes a user input through the autonomous ReAct cycle."""
         # Ultra-fast reflex route for common system tasks (<15ms)
@@ -60,9 +77,12 @@ class JarvisAgent:
         while iterations < self.max_iterations:
             iterations += 1
 
+            # Prune context to avoid TPM limit blowouts
+            active_context = self._prune_context()
+
             try:
                 response = self.llm.chat(
-                    messages=self.messages,
+                    messages=active_context,
                     tools=tools_schema if tools_schema else None,
                 )
             except Exception as e:
@@ -104,12 +124,17 @@ class JarvisAgent:
                     if self.on_tool_result:
                         self.on_tool_result(fn_name, result.output if result.success else result.error, result.success)
 
+                    # Truncate overly long tool outputs to 600 chars to conserve Groq TPM
+                    clean_content = result.to_message_content()
+                    if len(clean_content) > 600:
+                        clean_content = clean_content[:600] + "... [truncated to prevent rate limit]"
+
                     # Append tool execution result
                     self.messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": fn_name,
-                        "content": result.to_message_content(),
+                        "content": clean_content,
                     })
 
                 # Loop continues so the LLM can inspect tool outputs

@@ -7,11 +7,9 @@ logger = logging.getLogger("JARVIS.LLM")
 
 # Groq free-tier model cascade hierarchy for zero downtime / rate-limit resilience
 GROQ_CASCADE_MODELS = [
-    "openai/gpt-oss-120b",
-    "qwen/qwen3.8-27b",
     "openai/gpt-oss-20b",
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-120b",
 ]
 
 
@@ -32,6 +30,7 @@ class LLMClient:
 
         # Cooldown tracker: model_name -> expiry timestamp
         self._model_cooldowns: Dict[str, float] = {}
+        self._last_fallback_alert: Dict[str, float] = {}
 
         # Build cascade list ensuring primary model is first
         if self.provider == "groq":
@@ -125,13 +124,25 @@ class LLMClient:
             except Exception as e:
                 last_exception = e
                 if self._is_rate_limit_error(e) and idx < len(cascade) - 1:
-                    self._model_cooldowns[candidate_model] = time.time() + 60.0
+                    now_ts = time.time()
+                    self._model_cooldowns[candidate_model] = now_ts + 120.0
                     next_model = cascade[idx + 1]
-                    logger.warning(
-                        f"Rate limit encountered on {candidate_model}. Cascading failover to {next_model}."
-                    )
-                    if self.on_fallback:
-                        self.on_fallback(candidate_model, next_model, str(e))
+
+                    # Deduplicate alerts within 15 seconds
+                    pair_key = f"{candidate_model}->{next_model}"
+                    if now_ts - self._last_fallback_alert.get(pair_key, 0.0) > 15.0:
+                        self._last_fallback_alert[pair_key] = now_ts
+                        logger.warning(
+                            f"Rate limit on {candidate_model}. Cascading failover to {next_model}."
+                        )
+                        if self.on_fallback:
+                            self.on_fallback(candidate_model, next_model, str(e))
+
+                    # Pause briefly for token bucket recovery (parse 'try again in X.Xs' if available)
+                    import re
+                    retry_match = re.search(r"try again in ([\d\.]+)s", str(e), re.IGNORECASE)
+                    wait_s = float(retry_match.group(1)) if retry_match else 1.2
+                    time.sleep(min(2.5, wait_s))
                     continue
                 # If it's not a rate limit error or we have exhausted candidates, raise
                 raise e
