@@ -1,3 +1,24 @@
-.env
-
+# Python virtual environments & bytecode
 .venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment & Secrets
+.env
+.env.local
+*.key
+*.token
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & Temporary files
+logs/
+*.log
+*.tmp
+temp/
+screenshots/
