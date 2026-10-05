@@ -1,0 +1,111 @@
+import json
+from typing import Any, Callable, Dict, List, Optional
+from core.llm_client import LLMClient
+from core.prompts import get_system_prompt
+from core.safety import SafetyEngine
+from tools.base import ToolRegistry, ToolResult, registry as default_registry
+
+
+class JarvisAgent:
+    """The central ReAct (Reason + Act) autonomous orchestrator for J.A.R.V.I.S."""
+
+    def __init__(
+        self,
+        llm_client: Optional[LLMClient] = None,
+        tool_registry: Optional[ToolRegistry] = None,
+        safety_engine: Optional[SafetyEngine] = None,
+        max_iterations: int = 10,
+        on_thought: Optional[Callable[[str], None]] = None,
+        on_tool_call: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        on_tool_result: Optional[Callable[[str, Any, bool], None]] = None,
+    ):
+        self.llm = llm_client or LLMClient()
+        self.registry = tool_registry or default_registry
+        self.safety = safety_engine or SafetyEngine()
+        self.max_iterations = max_iterations
+        self.messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": get_system_prompt()}
+        ]
+        
+        # Event callbacks for CLI / UI hooks
+        self.on_thought = on_thought
+        self.on_tool_call = on_tool_call
+        self.on_tool_result = on_tool_result
+
+    def reset(self):
+        """Clears working memory back to the initial system prompt."""
+        self.messages = [
+            {"role": "system", "content": get_system_prompt()}
+        ]
+
+    def step(self, user_input: str) -> str:
+        """Processes a user input through the autonomous ReAct cycle."""
+        self.messages.append({"role": "user", "content": user_input})
+
+        tools_schema = self.registry.get_schemas()
+        iterations = 0
+
+        while iterations < self.max_iterations:
+            iterations += 1
+
+            try:
+                response = self.llm.chat(
+                    messages=self.messages,
+                    tools=tools_schema if tools_schema else None,
+                )
+            except Exception as e:
+                err_msg = f"Neural processing error: {e}"
+                if self.on_thought:
+                    self.on_thought(err_msg)
+                return f"I encountered an error communicating with my cognitive backend: {e}"
+
+            choice = response.choices[0]
+            message = choice.message
+
+            # Check if the LLM invoked tools
+            if hasattr(message, "tool_calls") and message.tool_calls:
+                # Add the assistant's tool-call request to the message history
+                self.messages.append(message.model_dump(exclude_none=True))
+
+                for tool_call in message.tool_calls:
+                    fn_name = tool_call.function.name
+                    raw_args = tool_call.function.arguments
+
+                    try:
+                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    except json.JSONDecodeError:
+                        args = {"raw_arguments": raw_args}
+
+                    if self.on_tool_call:
+                        self.on_tool_call(fn_name, args)
+
+                    # Authorize action via SafetyEngine
+                    tool_obj = self.registry.get_tool(fn_name)
+                    req_conf = tool_obj.requires_confirmation if tool_obj else False
+                    allowed, reject_reason = self.safety.authorize(fn_name, args, req_conf)
+
+                    if not allowed:
+                        result = ToolResult(success=False, output=None, error=reject_reason)
+                    else:
+                        result = self.registry.execute(fn_name, args)
+
+                    if self.on_tool_result:
+                        self.on_tool_result(fn_name, result.output if result.success else result.error, result.success)
+
+                    # Append tool execution result
+                    self.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": fn_name,
+                        "content": result.to_message_content(),
+                    })
+
+                # Loop continues so the LLM can inspect tool outputs
+                continue
+
+            # No tool calls: final answer produced
+            content = message.content or ""
+            self.messages.append({"role": "assistant", "content": content})
+            return content
+
+        return "I have reached the maximum reasoning iterations for this task without reaching a final conclusion, Sir."
