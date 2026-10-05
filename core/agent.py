@@ -1,5 +1,6 @@
 import json
 from typing import Any, Callable, Dict, List, Optional
+from core.fast_path import FastPathRouter
 from core.llm_client import LLMClient
 from core.prompts import get_system_prompt
 from core.safety import SafetyEngine
@@ -15,6 +16,7 @@ class JarvisAgent:
         tool_registry: Optional[ToolRegistry] = None,
         safety_engine: Optional[SafetyEngine] = None,
         max_iterations: int = 10,
+        enable_fast_path: bool = True,
         on_thought: Optional[Callable[[str], None]] = None,
         on_tool_call: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_tool_result: Optional[Callable[[str, Any, bool], None]] = None,
@@ -23,6 +25,8 @@ class JarvisAgent:
         self.registry = tool_registry or default_registry
         self.safety = safety_engine or SafetyEngine()
         self.max_iterations = max_iterations
+        self.enable_fast_path = enable_fast_path
+        self.fast_path = FastPathRouter(registry=self.registry, safety=self.safety)
         self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": get_system_prompt()}
         ]
@@ -40,6 +44,14 @@ class JarvisAgent:
 
     def step(self, user_input: str) -> str:
         """Processes a user input through the autonomous ReAct cycle."""
+        # Ultra-fast reflex route for common system tasks (<15ms)
+        if self.enable_fast_path:
+            fast_reply = self.fast_path.route(user_input)
+            if fast_reply is not None:
+                self.messages.append({"role": "user", "content": user_input})
+                self.messages.append({"role": "assistant", "content": fast_reply})
+                return fast_reply
+
         self.messages.append({"role": "user", "content": user_input})
 
         tools_schema = self.registry.get_schemas()
