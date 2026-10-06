@@ -18,6 +18,7 @@ import tools.file_ops
 import tools.system_ctl
 import tools.shell_runner
 import tools.browser_dom
+import tools.memory_ops
 import vision.capture
 import vision.grounding
 import vision.visual_diff
@@ -26,6 +27,7 @@ import gui_driver.navigator
 import voice.speaker
 import voice.listener
 import voice.wake_word
+from memory.store import memory_store
 from voice.speaker import speaker
 from voice.listener import listener
 
@@ -37,7 +39,8 @@ def display_welcome_banner():
     banner_text.append("J . A . R . V . I . S .\n", style="bold cyan")
     banner_text.append("Just A Rather Very Intelligent System\n", style="italic white")
     banner_text.append(f"Operating System: Linux (Session: {settings.WORKSPACE_DIR})\n", style="dim cyan")
-    banner_text.append(f"Active Provider: {settings.DEFAULT_PROVIDER.upper()} | Model: {settings.DEFAULT_MODEL}", style="dim green")
+    mem_count = len(memory_store.list_all())
+    banner_text.append(f"Active Provider: {settings.DEFAULT_PROVIDER.upper()} | Model: {settings.DEFAULT_MODEL} | Memory: {mem_count} items", style="dim green")
 
     console.print(Panel(banner_text, border_style="cyan", expand=False))
 
@@ -51,6 +54,28 @@ def display_tools_table():
         table.add_row(name, tool.description or "No description provided.")
 
     console.print(table)
+
+
+def display_memory_table():
+    profile = memory_store.get_profile()
+    memories = memory_store.list_all(limit=50)
+
+    table = Table(title="🧠 Persistent Memory Bank", border_style="cyan")
+    table.add_column("Category", style="bold yellow")
+    table.add_column("Content", style="white")
+    table.add_column("Importance", style="green")
+
+    if profile:
+        for k, v in profile.items():
+            table.add_row("Profile", f"{k.capitalize()}: {v}", "5/5")
+
+    for m in memories:
+        table.add_row(m.category.capitalize(), m.content, f"{m.importance}/5")
+
+    if not profile and not memories:
+        console.print("[dim yellow]No memories currently stored in the memory bank.[/dim yellow]")
+    else:
+        console.print(table)
 
 
 def main():
@@ -118,7 +143,7 @@ def main():
         f"\n[bold yellow]⚠️ Rate limit reached for {old_m}. Automatically cascading to {new_m}...[/bold yellow]"
     )
 
-    console.print("\n[dim]Type your command below. Commands: 'exit' to quit, 'reset' to clear context, 'tools' to view tools, 'status' for telemetry, 'voice' to speak.[/dim]\n")
+    console.print("\n[dim]Type your command below. Commands: 'exit' to quit, 'reset' to clear context, 'tools' to view tools, 'memory' to view memories, 'status' for telemetry, 'voice' to speak.[/dim]\n")
 
     while True:
         try:
@@ -140,6 +165,9 @@ def main():
             continue
         elif cmd == "tools":
             display_tools_table()
+            continue
+        elif cmd in ("memory", "memories"):
+            display_memory_table()
             continue
         elif cmd == "status":
             result = registry.execute("get_system_telemetry", {})

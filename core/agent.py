@@ -5,6 +5,7 @@ from core.llm_client import LLMClient
 from core.prompts import get_system_prompt
 from core.safety import SafetyEngine
 from core.workspace import workspace_manager
+from memory.store import MemoryStore, memory_store as default_memory_store
 from tools.base import ToolRegistry, ToolResult, registry as default_registry
 
 
@@ -16,6 +17,7 @@ class JarvisAgent:
         llm_client: Optional[LLMClient] = None,
         tool_registry: Optional[ToolRegistry] = None,
         safety_engine: Optional[SafetyEngine] = None,
+        memory_store: Optional[MemoryStore] = None,
         max_iterations: int = 10,
         enable_fast_path: bool = True,
         on_thought: Optional[Callable[[str], None]] = None,
@@ -26,11 +28,12 @@ class JarvisAgent:
         self.llm = llm_client or LLMClient()
         self.registry = tool_registry or default_registry
         self.safety = safety_engine or SafetyEngine()
+        self.memory = memory_store or default_memory_store
         self.max_iterations = max_iterations
         self.enable_fast_path = enable_fast_path
         self.fast_path = FastPathRouter(registry=self.registry, safety=self.safety)
         self.messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": get_system_prompt()}
+            {"role": "system", "content": self._build_system_prompt()}
         ]
         
         # Event callbacks for CLI / UI hooks
@@ -40,10 +43,23 @@ class JarvisAgent:
         self.on_workflow_plan = on_workflow_plan
         self.failed_operations: List[Dict[str, Any]] = []
 
+    def _build_system_prompt(self, user_query: Optional[str] = None) -> str:
+        """Constructs system prompt augmented with proactive long-term memory & relevant recalled facts."""
+        core_mem = self.memory.get_context_summary()
+        recalled_section = ""
+        if user_query:
+            relevant = self.memory.recall(user_query, limit=3)
+            if relevant:
+                recalled_lines = [f"  - [{m.category.capitalize()}] {m.content}" for m in relevant]
+                recalled_section = "• Relevant Recalled Memories for this instruction:\n" + "\n".join(recalled_lines)
+
+        full_mem_context = f"{core_mem}\n{recalled_section}".strip()
+        return get_system_prompt(memory_context=full_mem_context)
+
     def reset(self):
         """Clears working memory back to the initial system prompt."""
         self.messages = [
-            {"role": "system", "content": get_system_prompt()}
+            {"role": "system", "content": self._build_system_prompt()}
         ]
         self.failed_operations = []
 
@@ -88,6 +104,11 @@ class JarvisAgent:
             steps.append("3. **DOM Scanning**: Query page DOM structure for interactive buttons, links, and forms (<10ms).")
             steps.append("4. **Direct Interaction**: Execute DOM clicks and form inputs with pixel-perfect precision.")
             steps.append("5. **State Verification**: Confirm action results and report outcome.")
+        # Memory operations
+        elif any(w in prompt_lower for w in ["remember", "recall", "memorize", "forget", "memory", "memories", "preference"]):
+            steps.append("1. **Memory Ingestion/Retrieval**: Access persistent neural memory banks.")
+            steps.append("2. **State Synchronization**: Persist updates to disk and update user profile.")
+            steps.append("3. **Response Delivery**: Confirm memory state to user.")
         # File operations
         elif any(w in prompt_lower for w in ["file", "folder", "directory", "move", "copy", "delete", "create"]):
             steps.append("1. **Path Resolution**: Inspect source and target filesystem locations.")
@@ -120,6 +141,8 @@ class JarvisAgent:
         if self.on_workflow_plan:
             self.on_workflow_plan(workflow_plan)
 
+        # Refresh system prompt with latest memory context & relevant recalled facts
+        self.messages[0]["content"] = self._build_system_prompt(user_input)
         self.messages.append({"role": "user", "content": user_input})
 
         # Initialize working workspace if not already established

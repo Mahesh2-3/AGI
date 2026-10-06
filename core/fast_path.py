@@ -158,4 +158,48 @@ class FastPathRouter:
             if res.success and isinstance(res.output, dict):
                 return f"Vision status report, Sir: {res.output.get('summary', 'operational')}."
 
+        # 11. Remember Fact / Preference
+        m_rem = re.search(r"^(?:please )?(?:remember (?:that )?|don't forget (?:that )?|note (?:down )?(?:that )?)(.+)$", lower)
+        if m_rem:
+            raw_fact = text[m_rem.start(1):].strip()
+            from memory.store import memory_store
+            entry = memory_store.remember(raw_fact)
+            return f"I have committed that to long-term memory, Sir: \"{entry.content}\"."
+
+        # 12. Show / List Memories
+        if lower in (
+            "what do you remember about me",
+            "what do you remember",
+            "what are your memories",
+            "show memories",
+            "list memories",
+            "show my memories",
+            "what's in your memory",
+        ):
+            from memory.store import memory_store
+            profile = memory_store.get_profile()
+            entries = memory_store.list_all(limit=10)
+            if not profile and not entries:
+                return "My memory banks are currently empty, Sir. Tell me anything you'd like me to remember."
+
+            lines = ["Here is what I have stored in my long-term memory, Sir:"]
+            if profile:
+                prof_str = ", ".join([f"{k.capitalize()}: {v}" for k, v in profile.items()])
+                lines.append(f"• **User Profile**: {prof_str}")
+            if entries:
+                lines.append("• **Remembered Facts**:")
+                for m in entries:
+                    lines.append(f"  - [{m.category.capitalize()}] {m.content}")
+            return "\n".join(lines)
+
+        # 13. Forget Memory
+        m_forget = re.search(r"^(?:please )?(?:forget (?:that )?|delete memory (?:about )?)(.+)$", lower)
+        if m_forget:
+            target = text[m_forget.start(1):].strip()
+            from memory.store import memory_store
+            removed = memory_store.forget(target)
+            if removed:
+                return f"I have purged that from my memory banks, Sir: \"{removed.content}\"."
+            return f"I couldn't locate any memory matching \"{target}\", Sir."
+
         return None

@@ -22,3 +22,4 @@ logs/
 *.tmp
 temp/
 screenshots/
+data/

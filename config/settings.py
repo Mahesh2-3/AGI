@@ -27,8 +27,10 @@ class Settings:
     ASSISTANT_NAME: str = os.getenv("ASSISTANT_NAME", "Jarvis")
     USER_TITLE: str = os.getenv("USER_TITLE", "Sir")
 
-    # Workspace
+    # Workspace & Storage
     WORKSPACE_DIR: Path = BASE_DIR
+    DATA_DIR: Path = BASE_DIR / "data"
+    MEMORY_FILE_PATH: Path = Path(os.getenv("JARVIS_MEMORY_PATH", str(BASE_DIR / "data" / "jarvis_memory.json")))
 
 
 settings = Settings()
