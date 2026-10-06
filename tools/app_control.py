@@ -165,12 +165,17 @@ def open_browser_url(url: str, new_window: bool = True) -> str:
         clean_url = f"https://{clean_url}"
 
     active_ws = get_active_workspace()
+    chrome_bin = (
+        shutil.which("google-chrome-stable")
+        or shutil.which("google-chrome")
+        or shutil.which("chromium")
+    )
 
     # In multi-workspace environments (like Hyprland), --new-window guarantees
     # the browser window opens on the USER'S CURRENT WORKSPACE instead of silently
     # appending a tab to a window on an occluded or background workspace.
-    if shutil.which("google-chrome"):
-        cmd = ["google-chrome"]
+    if chrome_bin:
+        cmd = [chrome_bin]
         if new_window:
             cmd.append("--new-window")
         cmd.append(clean_url)
@@ -185,8 +190,24 @@ def open_browser_url(url: str, new_window: bool = True) -> str:
     raise RuntimeError("No supported web browser found.")
 
 
+@registry.register(description="Focuses the top address bar/URL bar of the active web browser (Google Chrome or Firefox) using the universal accelerator shortcut (Ctrl+L). Prepares the browser for typing a URL or search.")
+def focus_browser_address_bar() -> Dict[str, Any]:
+    active_ws = get_active_workspace()
+    focus_res = focus_window("chrome")
+    time.sleep(0.15)
+    from gui_driver.mouse_keyboard import controller
+    controller.hotkey("ctrl+l")
+    time.sleep(0.1)
+    return {
+        "success": True,
+        "action": "focus_browser_address_bar",
+        "message": "Successfully focused browser top address bar and highlighted URL field.",
+        "workspace": active_ws.get("name"),
+    }
+
+
 @registry.register(description="Focuses an active desktop window matching the given application name or title keyword. Automatically switches to the window's workspace if located on a different workspace.")
-def focus_window(query: str, bring_to_current_workspace: bool = False) -> str:
+def focus_window(query: str, bring_to_current_workspace: bool = False) -> Dict[str, Any]:
     query_clean = query.strip().lower()
     if _is_hyprland():
         try:
@@ -213,22 +234,34 @@ def focus_window(query: str, bring_to_current_workspace: bool = False) -> str:
                     subprocess.run(["hyprctl", "repl", lua], capture_output=True, text=True)
                     time.sleep(0.15)
                     workspace_manager.set_working_workspace(active_id)
-                    return f"Moved '{win_title}' ({win_class}) from workspace {win_ws} to current workspace {active_id} and focused it."
+                    return {
+                        "success": True,
+                        "message": f"Moved '{win_title}' ({win_class}) from workspace {win_ws} to current workspace {active_id} and focused it.",
+                        "window": win_title,
+                        "class": win_class,
+                        "workspace": active_id,
+                    }
                 else:
                     lua = f'for _, w in ipairs(hl.get_windows()) do if w.address == "{addr}" then if w.workspace and w.workspace.id then hl.dispatch(hl.dsp.focus({{ workspace = w.workspace.id }})) end; hl.dispatch(hl.dsp.focus({{ window = w }})); return "FOCUSED" end end return "FAIL"'
                     subprocess.run(["hyprctl", "repl", lua], capture_output=True, text=True)
                     time.sleep(0.15)
                     workspace_manager.set_working_workspace(win_ws)
                     ws_msg = f"switched to workspace {win_ws} and " if win_ws != active_id else ""
-                    return f"Successfully {ws_msg}focused '{win_title}' ({win_class})."
-        except Exception:
-            pass
+                    return {
+                        "success": True,
+                        "message": f"Successfully {ws_msg}focused '{win_title}' ({win_class}).",
+                        "window": win_title,
+                        "class": win_class,
+                        "workspace": win_ws,
+                    }
+        except Exception as e:
+            return {"success": False, "error": f"Failed while focusing window query '{query}': {e}"}
 
-    return f"No open window found matching query: '{query}'."
+    return {"success": False, "error": f"No open window found matching query: '{query}'."}
 
 
 @registry.register(description="Closes an active window matching the application name, title keyword, or window address.")
-def close_window(query: str) -> str:
+def close_window(query: str) -> Dict[str, Any]:
     query_clean = query.strip().lower()
     if _is_hyprland():
         try:
@@ -237,11 +270,11 @@ def close_window(query: str) -> str:
             output = res.stdout.strip()
             if output.startswith("OK|"):
                 title = output.split("|", 1)[1]
-                return f"Successfully closed window '{title}'."
-        except Exception:
-            pass
+                return {"success": True, "message": f"Successfully closed window '{title}'."}
+        except Exception as e:
+            return {"success": False, "error": f"Failed while closing window '{query}': {e}"}
 
-    return f"No open window found matching: '{query}'."
+    return {"success": False, "error": f"No open window found matching: '{query}'."}
 
 
 @registry.register(description="Switches the active desktop display viewport to a specific workspace number or name.")

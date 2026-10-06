@@ -17,6 +17,7 @@ def test_app_control_tools_registered():
     assert "list_running_processes" in names
     assert "open_path" in names
     assert "open_browser_url" in names
+    assert "focus_browser_address_bar" in names
     assert "terminate_process" in names
 
 

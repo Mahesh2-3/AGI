@@ -10,9 +10,9 @@ def test_workspace_manager_basic():
     assert "name" in active
     assert isinstance(active["id"], int)
 
-    # Initial working workspace defaults to active
+    # Initial working workspace defaults to active or process workspace
     working = mgr.get_working_workspace()
-    assert working == active["id"]
+    assert working in (active["id"], mgr.get_jarvis_process_workspace() or active["id"])
 
     # Explicit set
     mgr.set_working_workspace(5)

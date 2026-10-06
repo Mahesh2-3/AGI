@@ -73,6 +73,16 @@ def main():
     def on_thought(thought: str):
         console.print(f"[dim italic cyan]⚡ {thought}[/dim italic cyan]")
 
+    def on_workflow_plan(plan: str):
+        console.print(
+            Panel(
+                Markdown(plan),
+                title="📋 [bold cyan]Planned Execution Flow[/bold cyan]",
+                border_style="cyan",
+                expand=False,
+            )
+        )
+
     def on_tool_call(name: str, args: dict):
         console.print(f"[bold cyan]⚡ Calling Tool:[/bold cyan] [yellow]{name}[/yellow] [dim]args={args}[/dim]")
 
@@ -100,6 +110,7 @@ def main():
         on_thought=on_thought,
         on_tool_call=on_tool_call,
         on_tool_result=on_tool_result,
+        on_workflow_plan=on_workflow_plan,
     )
 
     # Hook model fallback notifications into terminal UI

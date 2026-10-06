@@ -16,7 +16,14 @@ class ToolResult(BaseModel):
             if isinstance(self.output, (dict, list)):
                 return json.dumps(self.output, indent=2)
             return str(self.output)
-        return f"Error executing tool: {self.error}"
+        details = ""
+        if self.output is not None:
+            details = f"\nDetails: {json.dumps(self.output, indent=2) if isinstance(self.output, (dict, list)) else self.output}"
+        return (
+            f"⚠️ OPERATION FAILED: {self.error}{details}\n"
+            f"[SYSTEM DIRECTIVE]: You MUST explicitly inform the user in your chat response about this failed operation and its reason."
+        )
+
 
 
 class Tool:
@@ -75,6 +82,9 @@ class Tool:
             else:
                 call_args = {k: v for k, v in kwargs.items() if k in sig.parameters}
             result = self.func(**call_args)
+            if isinstance(result, dict) and result.get("success") is False:
+                err_msg = result.get("error") or "Operation returned success=False"
+                return ToolResult(success=False, output=result, error=err_msg)
             return ToolResult(success=True, output=result)
         except Exception as e:
             return ToolResult(success=False, output=None, error=str(e))

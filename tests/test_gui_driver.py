@@ -31,8 +31,17 @@ def test_type_and_hotkey_simulation():
     assert "ctrl+c" in hotkey_res.output
 
 
+def test_click_mouse_execution():
+    res = registry.execute("click_mouse", {"x": 500, "y": 500, "action": "left"})
+    assert res.success is True
+    assert isinstance(res.output, dict)
+    assert res.output["button"] == "left"
+    assert "clicked_at" in res.output
+
+
 if __name__ == "__main__":
     test_gui_tools_registered()
     test_cursor_position_query()
     test_type_and_hotkey_simulation()
+    test_click_mouse_execution()
     print("✅ All GUI driver tests passed successfully!")
