@@ -46,7 +46,8 @@ class VLMHealthTracker:
 
     def _initialize_models(self):
         self.models.clear()
-        groq_key = settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY")
+        groq_keys = settings.GROQ_API_KEYS
+        groq_key = groq_keys[0] if groq_keys else (settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY"))
         google_key = settings.GOOGLE_API_KEY or os.environ.get("GOOGLE_API_KEY")
         openai_key = settings.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY")
 
@@ -164,7 +165,8 @@ class VisualGroundingEngine:
 
     def __init__(self, tracker: Optional[VLMHealthTracker] = None):
         self.tracker = tracker or vlm_tracker
-        self.groq_api_key = settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY")
+        self.groq_api_keys = list(settings.GROQ_API_KEYS)
+        self.groq_api_key = self.groq_api_keys[0] if self.groq_api_keys else (settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY"))
         self.google_api_key = settings.GOOGLE_API_KEY or os.environ.get("GOOGLE_API_KEY")
         self.openai_api_key = settings.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY")
 
@@ -312,23 +314,37 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
         """Dispatches an inference request to the appropriate VLM provider."""
         if model_info.provider == "groq":
             from groq import Groq
-            client = Groq(api_key=self.groq_api_key)
+            keys = self.groq_api_keys or ([self.groq_api_key] if self.groq_api_key else [])
             b64_img = base64.b64encode(img_bytes).decode("utf-8")
-            response = client.chat.completions.create(
-                model=model_info.model_name,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
+            last_err = None
+
+            for k in keys:
+                try:
+                    client = Groq(api_key=k)
+                    response = client.chat.completions.create(
+                        model=model_info.model_name,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
+                                ],
+                            }
                         ],
-                    }
-                ],
-                temperature=0.1,
-                max_tokens=max_tokens,
-            )
-            return response.choices[0].message.content or ""
+                        temperature=0.1,
+                        max_tokens=max_tokens,
+                    )
+                    return response.choices[0].message.content or ""
+                except Exception as e:
+                    last_err = e
+                    if any(x in str(e).lower() for x in ["429", "rate limit", "rate_limit"]):
+                        logger.warning(f"Groq vision key {k[:8]}... rate-limited. Trying next key in pool...")
+                        continue
+                    raise e
+
+            if last_err:
+                raise last_err
 
         elif model_info.provider == "google":
             from google import genai

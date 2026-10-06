@@ -26,6 +26,10 @@ class LLMClient:
         self.model = model or settings.DEFAULT_MODEL
         self.on_fallback = on_fallback
         self._client = None
+        self._groq_keys: List[str] = []
+        self._groq_clients: Dict[str, Any] = {}
+        self._key_cooldowns: Dict[str, float] = {}
+        self._current_key_idx: int = 0
         self._init_client()
 
         # Cooldown tracker: model_name -> expiry timestamp
@@ -55,10 +59,16 @@ class LLMClient:
 
     def _init_client(self):
         if self.provider == "groq":
-            api_key = settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY")
-            if api_key:
+            self._groq_keys = list(settings.GROQ_API_KEYS)
+            if not self._groq_keys:
+                single = settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY")
+                if single:
+                    self._groq_keys = [single.strip()]
+            if self._groq_keys:
                 from groq import Groq
-                self._client = Groq(api_key=api_key)
+                for k in self._groq_keys:
+                    self._groq_clients[k] = Groq(api_key=k)
+                self._client = self._groq_clients[self._groq_keys[0]]
             else:
                 self._client = None
         elif self.provider == "openai":
@@ -76,9 +86,45 @@ class LLMClient:
             else:
                 self._client = None
 
+    def _get_candidate_clients(self) -> List[tuple[str, Any]]:
+        """Returns active clients prioritized by cooldown status with round-robin load distribution."""
+        import time
+
+        # If _client was overridden by a test mock or custom object
+        if self._client and (not self._groq_keys or self._client not in self._groq_clients.values()):
+            return [("default", self._client)]
+
+        if self.provider != "groq" or not self._groq_keys:
+            return [("default", self._client)] if self._client else []
+
+        now = time.time()
+        ready = []
+        cooling = []
+
+        n = len(self._groq_keys)
+        ordered_keys = [self._groq_keys[(self._current_key_idx + i) % n] for i in range(n)]
+
+        for k in ordered_keys:
+            client = self._groq_clients.get(k)
+            if not client:
+                continue
+            cd = self._key_cooldowns.get(k, 0.0)
+            if now >= cd:
+                ready.append((k, client))
+            else:
+                cooling.append((k, client))
+
+        # Advance round-robin index
+        self._current_key_idx = (self._current_key_idx + 1) % max(1, n)
+        return ready if ready else cooling
+
     @property
     def is_configured(self) -> bool:
-        return self._client is not None
+        return self._client is not None or len(self._groq_clients) > 0
+
+    @property
+    def active_key_count(self) -> int:
+        return len(self._groq_keys) if self.provider == "groq" else (1 if self.is_configured else 0)
 
     def _is_rate_limit_error(self, err: Exception) -> bool:
         """Determines if the exception is due to rate limits or quota."""
@@ -96,11 +142,12 @@ class LLMClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: float = 0.5,
     ) -> Any:
-        """Sends chat request to the LLM backend with automatic fallback on rate limits."""
-        if not self._client:
+        """Sends chat request to the LLM backend with multi-key failover and model cascading."""
+        clients = self._get_candidate_clients()
+        if not clients:
             raise RuntimeError(
                 f"No API key found for provider '{self.provider}'. "
-                "Please configure GROQ_API_KEY or OPENAI_API_KEY in your .env file."
+                "Please configure GROQ_API_KEY (or multiple GROQ_API_KEYS) in your .env file."
             )
 
         last_exception = None
@@ -108,54 +155,75 @@ class LLMClient:
         cascade = self._get_active_cascade()
 
         for idx, candidate_model in enumerate(cascade):
-            kwargs: Dict[str, Any] = {
-                "model": candidate_model,
-                "messages": messages,
-                "temperature": temperature,
-            }
+            for key_idx, (key_id, client) in enumerate(clients):
+                kwargs: Dict[str, Any] = {
+                    "model": candidate_model,
+                    "messages": messages,
+                    "temperature": temperature,
+                }
 
-            if tools and len(tools) > 0:
-                kwargs["tools"] = tools
-                kwargs["tool_choice"] = "auto"
+                if tools and len(tools) > 0:
+                    kwargs["tools"] = tools
+                    kwargs["tool_choice"] = "auto"
 
-            try:
-                response = self._client.chat.completions.create(**kwargs)
-                return response
-            except Exception as e:
-                last_exception = e
-                err_lower = str(e).lower()
-                is_recoverable = (
-                    self._is_rate_limit_error(e)
-                    or "tool_use_failed" in err_lower
-                    or "tool choice is none" in err_lower
-                    or "failed_generation" in err_lower
-                    or "output_parse_failed" in err_lower
-                    or "503" in err_lower
-                    or "500" in err_lower
-                )
-                if is_recoverable and idx < len(cascade) - 1:
-                    now_ts = time.time()
-                    self._model_cooldowns[candidate_model] = now_ts + 120.0
-                    next_model = cascade[idx + 1]
+                try:
+                    response = client.chat.completions.create(**kwargs)
+                    return response
+                except Exception as e:
+                    last_exception = e
+                    err_lower = str(e).lower()
+                    is_rate_limit = self._is_rate_limit_error(e)
 
-                    # Deduplicate alerts within 15 seconds
-                    pair_key = f"{candidate_model}->{next_model}"
-                    if now_ts - self._last_fallback_alert.get(pair_key, 0.0) > 15.0:
-                        self._last_fallback_alert[pair_key] = now_ts
+                    # Multi-key rotation on rate limit before degrading model
+                    if is_rate_limit and len(clients) > 1:
+                        self._key_cooldowns[key_id] = time.time() + 60.0
                         logger.warning(
-                            f"Model issue on {candidate_model} ({e}). Cascading failover to {next_model}."
+                            f"Groq key {key_id[:8]}... rate-limited on {candidate_model}. "
+                            f"{len(clients) - 1 - key_idx} keys remaining in pool."
                         )
-                        if self.on_fallback:
-                            self.on_fallback(candidate_model, next_model, str(e))
+                        if key_idx < len(clients) - 1:
+                            next_key_id = clients[key_idx + 1][0]
+                            if self.on_fallback:
+                                self.on_fallback(
+                                    f"Key {key_id[:8]}...",
+                                    f"Key {next_key_id[:8]}...",
+                                    f"Rate limit on {candidate_model}; rotating to alternate Groq key",
+                                )
+                            continue
 
-                    # Pause briefly for token bucket recovery (parse 'try again in X.Xs' if available)
-                    import re
-                    retry_match = re.search(r"try again in ([\d\.]+)s", str(e), re.IGNORECASE)
-                    wait_s = float(retry_match.group(1)) if retry_match else 1.2
-                    time.sleep(min(2.5, wait_s))
-                    continue
-                # If it's not recoverable or we have exhausted candidates, raise
-                raise e
+                    is_recoverable = (
+                        is_rate_limit
+                        or "tool_use_failed" in err_lower
+                        or "tool choice is none" in err_lower
+                        or "failed_generation" in err_lower
+                        or "output_parse_failed" in err_lower
+                        or "503" in err_lower
+                        or "500" in err_lower
+                    )
+                    if is_recoverable and idx < len(cascade) - 1:
+                        now_ts = time.time()
+                        self._model_cooldowns[candidate_model] = now_ts + 120.0
+                        next_model = cascade[idx + 1]
+
+                        # Deduplicate alerts within 15 seconds
+                        pair_key = f"{candidate_model}->{next_model}"
+                        if now_ts - self._last_fallback_alert.get(pair_key, 0.0) > 15.0:
+                            self._last_fallback_alert[pair_key] = now_ts
+                            logger.warning(
+                                f"Model issue on {candidate_model} ({e}). Cascading failover to {next_model}."
+                            )
+                            if self.on_fallback:
+                                self.on_fallback(candidate_model, next_model, str(e))
+
+                        # Pause briefly for token bucket recovery
+                        import re
+                        retry_match = re.search(r"try again in ([\d\.]+)s", str(e), re.IGNORECASE)
+                        wait_s = float(retry_match.group(1)) if retry_match else 1.2
+                        time.sleep(min(2.5, wait_s))
+                        break  # Break out of key loop to cascade to next candidate model
+
+                    # If not recoverable or exhausted all models, raise
+                    raise e
 
         if last_exception:
             raise last_exception
@@ -166,11 +234,12 @@ class LLMClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: float = 0.5,
     ) -> Generator[Any, None, None]:
-        """Streams chat completion tokens with automatic fallback on rate limits."""
-        if not self._client:
+        """Streams chat completion tokens with multi-key failover and model cascading."""
+        clients = self._get_candidate_clients()
+        if not clients:
             raise RuntimeError(
                 f"No API key found for provider '{self.provider}'. "
-                "Please configure GROQ_API_KEY or OPENAI_API_KEY in your .env file."
+                "Please configure GROQ_API_KEY in your .env file."
             )
 
         last_exception = None
@@ -178,34 +247,38 @@ class LLMClient:
         cascade = self._get_active_cascade()
 
         for idx, candidate_model in enumerate(cascade):
-            kwargs: Dict[str, Any] = {
-                "model": candidate_model,
-                "messages": messages,
-                "temperature": temperature,
-                "stream": True,
-            }
+            for key_idx, (key_id, client) in enumerate(clients):
+                kwargs: Dict[str, Any] = {
+                    "model": candidate_model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "stream": True,
+                }
 
-            if tools and len(tools) > 0:
-                kwargs["tools"] = tools
-                kwargs["tool_choice"] = "auto"
+                if tools and len(tools) > 0:
+                    kwargs["tools"] = tools
+                    kwargs["tool_choice"] = "auto"
 
-            try:
-                stream = self._client.chat.completions.create(**kwargs)
-                for chunk in stream:
-                    yield chunk
-                return
-            except Exception as e:
-                last_exception = e
-                if self._is_rate_limit_error(e) and idx < len(cascade) - 1:
-                    self._model_cooldowns[candidate_model] = time.time() + 60.0
-                    next_model = cascade[idx + 1]
-                    logger.warning(
-                        f"Rate limit encountered on {candidate_model}. Cascading failover stream to {next_model}."
-                    )
-                    if self.on_fallback:
-                        self.on_fallback(candidate_model, next_model, str(e))
-                    continue
-                raise e
+                try:
+                    stream = client.chat.completions.create(**kwargs)
+                    for chunk in stream:
+                        yield chunk
+                    return
+                except Exception as e:
+                    last_exception = e
+                    if self._is_rate_limit_error(e) and len(clients) > 1 and key_idx < len(clients) - 1:
+                        self._key_cooldowns[key_id] = time.time() + 60.0
+                        continue
+                    if self._is_rate_limit_error(e) and idx < len(cascade) - 1:
+                        self._model_cooldowns[candidate_model] = time.time() + 60.0
+                        next_model = cascade[idx + 1]
+                        logger.warning(
+                            f"Rate limit encountered on {candidate_model}. Cascading failover stream to {next_model}."
+                        )
+                        if self.on_fallback:
+                            self.on_fallback(candidate_model, next_model, str(e))
+                        break
+                    raise e
 
         if last_exception:
             raise last_exception

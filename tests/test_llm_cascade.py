@@ -72,8 +72,37 @@ def test_llm_client_cooldown():
     assert last_call_kwargs["model"] == client.model_cascade[1]
 
 
+def test_llm_client_multi_key_rotation():
+    client = LLMClient(provider="groq")
+    mock_sdk1 = MagicMock()
+    mock_sdk2 = MagicMock()
+
+    client._groq_keys = ["gsk_key1", "gsk_key2"]
+    client._groq_clients = {"gsk_key1": mock_sdk1, "gsk_key2": mock_sdk2}
+    client._client = mock_sdk1
+
+    # Key 1 hits 429 rate limit, Key 2 succeeds on the primary model
+    mock_sdk1.chat.completions.create.side_effect = MockRateLimitError("429 TPM limit reached")
+    mock_sdk2.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content="Answer from Key 2"))]
+    )
+
+    fallback_notes = []
+    client.on_fallback = lambda old, new, reason: fallback_notes.append((old, new, reason))
+
+    res = client.chat(messages=[{"role": "user", "content": "Hello pool"}])
+
+    assert res.choices[0].message.content == "Answer from Key 2"
+    assert "gsk_key1" in client._key_cooldowns
+    # Primary model was retained without degrading
+    assert mock_sdk2.chat.completions.create.call_args.kwargs["model"] == client.model_cascade[0]
+    assert len(fallback_notes) == 1
+    assert "rotating to alternate Groq key" in fallback_notes[0][2]
+
+
 if __name__ == "__main__":
     test_llm_client_rate_limit_cascading()
     test_llm_client_non_rate_limit_error_not_swallowed()
     test_llm_client_cooldown()
+    test_llm_client_multi_key_rotation()
     print("✅ All LLM cascade tests passed successfully!")
