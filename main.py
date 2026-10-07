@@ -115,16 +115,60 @@ def main():
         status_symbol = "[bold green]✓[/bold green]" if success else "[bold red]✗[/bold red]"
         console.print(f"  {status_symbol} [dim green]Result from {name}:[/dim green] [dim]{str(output)[:200]}...[/dim]")
 
+    active_status = None
+    current_turn_voice = False
+
     def confirmation_prompt(tool_name: str, args: dict, reason: str) -> bool:
-        console.print(f"\n[bold red]⚠️ SAFETY CONFIRMATION REQUIRED[/bold red]")
-        console.print(f"  [yellow]Tool:[/yellow] {tool_name}")
-        console.print(f"  [yellow]Arguments:[/yellow] {args}")
-        console.print(f"  [yellow]Risk Assessment:[/yellow] {reason}")
-        try:
-            ans = console.input("[bold white]Authorise Jarvis to execute this action? (y/N): [/bold white]").strip().lower()
-            return ans in ("y", "yes")
-        except (KeyboardInterrupt, EOFError):
-            return False
+        nonlocal active_status, current_turn_voice
+        was_spinning = False
+        if active_status is not None and getattr(active_status, "_live", None) and active_status._live.is_started:
+            active_status.stop()
+            was_spinning = True
+
+        panel_text = Text()
+        panel_text.append("Tool: ", style="bold yellow")
+        panel_text.append(f"{tool_name}\n", style="white")
+        panel_text.append("Arguments: ", style="bold yellow")
+        panel_text.append(f"{args}\n", style="cyan")
+        panel_text.append("Risk Assessment: ", style="bold yellow")
+        panel_text.append(f"{reason}", style="white")
+
+        console.print()
+        console.print(
+            Panel(
+                panel_text,
+                title="⚠️  [bold red]SAFETY AUTHORISATION REQUIRED[/bold red]",
+                border_style="red",
+                expand=False,
+            )
+        )
+
+        granted = False
+        if current_turn_voice:
+            console.print("[dim cyan]🎤 Jarvis: Awaiting voice authorisation (say 'yes' or 'no')...[/dim cyan]")
+            speaker.speak(f"Sir, authorisation is required to execute {tool_name}. Do you approve?", wait=True)
+            try:
+                voice_reply = listener.listen(duration_seconds=5.0, use_vad=True).lower().strip()
+                if any(w in voice_reply for w in ("yes", "approve", "confirm", "proceed", "yeah", "yep", "do it")):
+                    console.print("[bold green]✓ Voice Authorisation Granted.[/bold green]")
+                    granted = True
+                elif any(w in voice_reply for w in ("no", "deny", "cancel", "stop", "abort")):
+                    console.print("[bold red]✗ Voice Authorisation Denied.[/bold red]")
+                    granted = False
+            except Exception:
+                pass
+
+        if not granted:
+            try:
+                ans = console.input("[bold white]Authorise Jarvis to execute this action? (y/N): [/bold white]").strip().lower()
+                granted = ans in ("y", "yes")
+            except (KeyboardInterrupt, EOFError):
+                granted = False
+
+        if was_spinning and active_status is not None:
+            active_status.start()
+
+        return granted
 
     safety = SafetyEngine(confirmation_handler=confirmation_prompt)
 
@@ -175,8 +219,10 @@ def main():
             continue
 
         is_voice = False
+        current_turn_voice = False
         if cmd in ("voice", "listen"):
             is_voice = True
+            current_turn_voice = True
             console.print("[bold cyan]🎤 Jarvis Voice Mode Active[/bold cyan] [dim](Listening with real-time VAD...)[/dim]")
             speaker.speak("Listening, Sir.", wait=True)
             with console.status("[bold cyan]Listening to microphone (speak now)...[/bold cyan]", spinner="arc"):
@@ -193,8 +239,10 @@ def main():
             console.print(f"[bold green]{settings.USER_TITLE} (Voice):[/bold green] [italic white]{speech_text}[/italic white]")
             user_input = speech_text
 
-        with console.status("[bold cyan]Jarvis is processing...[/bold cyan]", spinner="dots"):
+        active_status = console.status("[bold cyan]Jarvis is processing...[/bold cyan]", spinner="dots")
+        with active_status:
             response = agent.step(user_input)
+        active_status = None
 
         console.print(f"\n[bold cyan]{settings.ASSISTANT_NAME}:[/bold cyan]")
         console.print(Markdown(response))
