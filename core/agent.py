@@ -24,7 +24,7 @@ class JarvisAgent:
         enable_fast_path: bool = True,
         on_thought: Optional[Callable[[str], None]] = None,
         on_tool_call: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-        on_tool_result: Optional[Callable[[str, Any, bool], None]] = None,
+        on_tool_result: Optional[Callable[..., None]] = None,
         on_workflow_plan: Optional[Callable[[str], None]] = None,
     ):
         self.llm = llm_client or LLMClient()
@@ -59,12 +59,10 @@ class JarvisAgent:
             return f"{mins}m {rem_sec:.1f}s ({seconds:.2f}s)"
 
     def _append_timing(self, reply: str, start_time: float) -> str:
-        """Appends elapsed operation duration to the final response."""
+        """Records elapsed operation duration telemetry without appending to user-facing reply."""
         elapsed = time.perf_counter() - start_time
         self.last_step_duration = elapsed
-        timing_str = f"⏱️ *Operation completed in {self.format_duration(elapsed)}*"
-        clean_reply = reply.rstrip()
-        return f"{clean_reply}\n\n{timing_str}"
+        return reply.rstrip()
 
     def _build_system_prompt(self, user_query: Optional[str] = None) -> str:
         """Constructs system prompt augmented with proactive long-term memory & relevant recalled facts."""
@@ -103,65 +101,133 @@ class JarvisAgent:
                 pruned.append(m)
         return pruned
 
+    def _generate_workflow_via_llm(self, user_input: str) -> Optional[str]:
+        """Queries LLM for a fast one-line conditional arrow-chain workflow."""
+        prompt = (
+            "Generate a high-level execution workflow for desktop AI assistant Jarvis.\n"
+            "Format strictly as a single line using ' -> ' between steps, including conditional 'if' and 'else'.\n"
+            "Example: see the screen -> if browser has github tab that contains a repo -> go to the commits -> analyze commits using DOM -> else tell the user there is no github tab is opened\n\n"
+            f"User request: {user_input}\n"
+            "Workflow:"
+        )
+        try:
+            resp = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": "You are a desktop AI workflow planner. Output ONLY the single-line arrow chain."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=80,
+                temperature=0.1,
+            )
+            raw = resp.choices[0].message.content.strip()
+            raw = raw.strip('"`\n ')
+            if "->" in raw:
+                return raw.split("\n")[0].strip()
+        except Exception:
+            return None
+        return None
+
     def generate_workflow_plan(self, user_input: str) -> str:
-        """Constructs a clear, concise step-by-step workflow plan for user inspection."""
-        prompt_lower = user_input.lower()
-        steps = []
+        """Constructs a conditional arrow-chained workflow plan (step -> if ... -> else ...) for user inspection."""
+        prompt_lower = user_input.lower().strip()
 
         # Check for explicit arrow chains e.g. "step 1 -> step 2 -> step 3"
         if "->" in user_input:
-            chain_parts = [p.strip() for p in user_input.split("->") if p.strip()]
-            for idx, part in enumerate(chain_parts, 1):
-                steps.append(f"{idx}. **{part.capitalize()}**")
-            return "\n".join(steps)
+            parts = [p.strip() for p in user_input.split("->") if p.strip()]
+            return " -> ".join(parts)
 
-        # Visual Perception / Screen Inspection
-        if any(w in prompt_lower for w in ["what are you seeing", "what do you see", "see on the screen", "inspect screen", "look at the screen", "read screen", "screen description"]):
-            steps.append("1. **Visual Screen Capture**: Capture high-resolution screenshot of current display.")
-            steps.append("2. **Context-Aware Perception**: Condition VLM inspection directly on user's query.")
-            steps.append("3. **Insight Delivery**: Present focused visual observations and findings.")
-            return "\n".join(steps)
+        # 1. Commits / GitHub / Repository inspection (e.g. user directive)
+        if any(w in prompt_lower for w in ["commit", "commits", "repository", "repo", "github"]):
+            return (
+                "see the screen -> if browser has github tab that contains a repo -> "
+                "go to the commits -> analyze commits using DOM -> "
+                "else tell the user there is no github tab is opened"
+            )
 
-        # Existing Open Window / Desktop Interaction (e.g. "don't open new web session", "already opened", "currently open")
-        if any(phrase in prompt_lower for phrase in ["don't open new", "do not open new", "already opened", "already open", "currently open", "existing window"]):
-            steps.append("1. **Window Identification**: Locate and focus existing desktop application/browser window.")
-            steps.append("2. **Contextual Action Dispatch**: Direct native inputs and clicks into active window.")
-            steps.append("3. **State Verification**: Confirm interaction outcome without launching duplicate sessions.")
-            return "\n".join(steps)
+        # 2. Visual Screen Capture & Perception
+        if any(w in prompt_lower for w in [
+            "what are you seeing", "what do you see", "see on the screen", "inspect screen",
+            "look at the screen", "read screen", "screen description", "what is on the screen"
+        ]):
+            return (
+                "capture screenshot -> inspect screen with context-aware VLM -> "
+                "extract UI elements and state -> present visual observations to user"
+            )
 
-        # Workspace / isolation
+        # 3. Existing Open Window / Interaction without opening duplicate sessions
+        if any(phrase in prompt_lower for phrase in [
+            "don't open new", "do not open new", "already opened", "already open",
+            "currently open", "existing window", "existing browser"
+        ]):
+            return (
+                "inspect active windows -> if target window is open -> "
+                "focus window -> dispatch input actions directly -> "
+                "else report target window is not open"
+            )
+
+        # 4. Workspace / isolation
         if "new workspace" in prompt_lower or "workspace" in prompt_lower:
-            steps.append("1. **Workspace Routing**: Switch to a designated desktop workspace for isolation.")
+            return (
+                "check workspaces -> switch to isolated workspace -> "
+                "launch target application -> verify workspace focus -> perform actions"
+            )
 
-        # Web / Browser
-        if any(w in prompt_lower for w in ["browser", "chess", "website", "url", "http", "google", "youtube", "github"]):
-            if not steps:
-                steps.append("1. **Workspace Routing**: Verify active workspace and window focus.")
-            steps.append("2. **High-Speed Navigation**: Launch browser and navigate directly to target URL via DOM driver.")
-            steps.append("3. **DOM Scanning**: Query page DOM structure for interactive buttons, links, and forms (<10ms).")
-            steps.append("4. **Direct Interaction**: Execute DOM clicks and form inputs with pixel-perfect precision.")
-            steps.append("5. **State Verification**: Confirm action results and report outcome.")
-        # Memory operations
-        elif any(w in prompt_lower for w in ["remember", "recall", "memorize", "forget", "memory", "memories", "preference"]):
-            steps.append("1. **Memory Ingestion/Retrieval**: Access persistent neural memory banks.")
-            steps.append("2. **State Synchronization**: Persist updates to disk and update user profile.")
-            steps.append("3. **Response Delivery**: Confirm memory state to user.")
-        # File operations
-        elif any(w in prompt_lower for w in ["file", "folder", "directory", "move", "copy", "delete", "create"]):
-            steps.append("1. **Path Resolution**: Inspect source and target filesystem locations.")
-            steps.append("2. **Filesystem Execution**: Perform file and folder manipulations safely.")
-            steps.append("3. **Verification**: Confirm changes on disk and report status.")
-        # General GUI / desktop
-        elif any(w in prompt_lower for w in ["click", "open", "launch", "press", "type"]):
-            steps.append("1. **Window / UI Targeting**: Locate application windows or screen coordinates.")
-            steps.append("2. **Input Dispatch**: Execute native Wayland hardware pointer/keyboard events.")
-            steps.append("3. **Visual Verification**: Confirm UI response via screen diffing.")
-        else:
-            steps.append("1. **Intent Analysis**: Determine required system capabilities and tools.")
-            steps.append("2. **Autonomous Execution**: Invoke designated tools in sequence.")
-            steps.append("3. **Outcome Delivery**: Present completed work and status.")
+        # 5. Browser / Web navigation
+        if any(w in prompt_lower for w in [
+            "browser", "chess", "website", "url", "http", "google", "youtube", "webpage", "web page"
+        ]):
+            return (
+                "check open windows -> if browser is running -> switch to tab -> "
+                "else launch browser in workspace -> navigate to target URL -> "
+                "scan page DOM -> interact with elements -> verify outcome"
+            )
 
-        return "\n".join(steps)
+        # 6. Memory operations
+        if any(w in prompt_lower for w in [
+            "remember", "recall", "memorize", "forget", "memory", "memories", "preference"
+        ]):
+            return (
+                "query neural memory store -> if relevant record exists -> "
+                "update or recall context -> persist memory state -> confirm to user"
+            )
+
+        # 7. File operations
+        if any(w in prompt_lower for w in [
+            "file", "folder", "directory", "move", "copy", "delete", "create"
+        ]):
+            return (
+                "inspect filesystem path -> if path exists -> perform file operation -> "
+                "verify disk changes -> else report path not found"
+            )
+
+        # 8. GUI Targeting & Interaction (click, type, press)
+        if any(w in prompt_lower for w in ["click", "press", "button", "tap"]):
+            return (
+                "capture screenshot -> locate target element via vision grounding -> "
+                "move mouse to coordinates -> if target confirmed -> execute click -> "
+                "else report element not found"
+            )
+
+        if any(w in prompt_lower for w in ["type", "input text", "enter text"]):
+            return (
+                "locate target input field -> if field found -> focus input -> "
+                "type text payload -> verify input state -> else report input field missing"
+            )
+
+        # 9. Dynamic synthesis via LLM if configured, otherwise structured conditional fallback
+        if getattr(self.llm, "is_configured", False):
+            try:
+                llm_plan = self._generate_workflow_via_llm(user_input)
+                if llm_plan:
+                    return llm_plan
+            except Exception:
+                pass
+
+        return (
+            "analyze user request -> identify target application -> "
+            "dispatch actions -> if action succeeds -> verify outcome -> "
+            "else report issue to user"
+        )
 
     def step(self, user_input: str) -> str:
         """Processes a user input through the autonomous ReAct cycle."""
@@ -241,6 +307,7 @@ class JarvisAgent:
                     req_conf = tool_obj.requires_confirmation if tool_obj else False
                     allowed, reject_reason = self.safety.authorize(fn_name, args, req_conf)
 
+                    duration = 0.0
                     if not allowed:
                         result = ToolResult(success=False, output=None, error=reject_reason)
                     else:
@@ -255,7 +322,9 @@ class JarvisAgent:
                         ):
                             workspace_manager.ensure_working_workspace_active()
 
+                        tool_start = time.perf_counter()
                         result = self.registry.execute(fn_name, args)
+                        duration = time.perf_counter() - tool_start
 
                     if not result.success:
                         self.failed_operations.append({
@@ -265,7 +334,10 @@ class JarvisAgent:
                         })
 
                     if self.on_tool_result:
-                        self.on_tool_result(fn_name, result.output if result.success else result.error, result.success)
+                        try:
+                            self.on_tool_result(fn_name, result.output if result.success else result.error, result.success, duration)
+                        except TypeError:
+                            self.on_tool_result(fn_name, result.output if result.success else result.error, result.success)
 
                     # Preserve rich perception outputs (inspect_screen, DOM, windows) while guarding against massive outputs
                     clean_content = result.to_message_content()
