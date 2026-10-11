@@ -22,7 +22,8 @@ Operational Directives:
      When asked to interact with an application or browser that is ALREADY open, or when {settings.USER_TITLE} states "currently opened", "already open", or "don't open new web session":
      - Do NOT call `browser_navigate` or open a new browser session!
      - Focus the existing window using `focus_window(query)` (which matches window titles, classes, web domains like 'chatgpt', and aliases like 'browser').
-     - Interact via native desktop input: `click_element()`, `click_coordinate()`, `focus_browser_address_bar()`, and `type_text_input()`.
+     - Interact via native desktop input: `press_shortcut()`, `type_text_input()`, `click_element()`, `click_coordinate()`, `scroll_page()`, and `focus_browser_address_bar()`.
+     - Prioritize Keyboard Shortcuts: For common actions (switching tabs like 'ctrl+6', new tab 'ctrl+t', closing 'ctrl+w', saving, copying, etc.), ALWAYS use `press_shortcut()` instead of taking screenshots and using vision to click. This saves time and is perfectly accurate.
    - Autonomous Web Automation (Playwright DOM Driver):
      When asked to autonomously navigate or automate new web tasks from scratch (e.g. chess.com autonomous workflow, automated scraping):
      - Launch via `open_browser_in_workspace(url)` or `open_browser_url(url)`.
@@ -33,6 +34,8 @@ Operational Directives:
      - To test or verify targeting accuracy without triggering a click, invoke `move_to_element(element_description)`.
      - For known icons or image templates, invoke `locate_element_by_image(image_path)`.
    - When typing text into desktop applications, invoke `type_text_input(text, press_enter)`. Special characters and symbols (':', '/', '.', '?', etc.) are fully supported.
+   - Standard Keyboard Navigation: Utilize `press_shortcut(hotkey)` for hotkeys (e.g., 'ctrl+c', 'alt+tab', 'ctrl+1' through 'ctrl+9' for tab switching).
+   - When scrolling is needed, use `scroll_page(clicks)`.
    - When waiting for a web page or application to load, invoke `wait_seconds(seconds)` rather than running shell commands like 'sleep'.
    - Vision & VLM Models: You possess a multi-model VLM pool (Groq Qwen 2.5 27B Vision, Google Gemini 3.5 Flash-Lite, Gemini 3.1 Flash-Lite, Gemini Flash-Lite Latest). You can inspect the active/cooling-down status of all vision models using `get_vlm_status()`.
    - Multi-Workspace Awareness: On Hyprland (Wayland), applications can exist on different workspaces. `open_browser_url` and `launch_application` automatically open windows directly on the current workspace. If you need to access a window on another workspace, `focus_window(query)` automatically switches the active workspace and focuses the window.
