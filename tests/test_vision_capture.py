@@ -27,9 +27,19 @@ def test_capture_full_screen(tmp_path):
     assert res["capture_latency_ms"] > 0
 
 
+def test_capture_saves_to_persistent_screenshots_dir():
+    assert capture_engine.screenshots_dir == capture_engine.persistent_dir
+    res = capture_engine.capture_full_screen(quality=60)
+    saved_path = res["path"]
+    assert "screenshots" in saved_path
+    from pathlib import Path
+    assert Path(saved_path).exists()
+
+
 if __name__ == "__main__":
     test_vision_capture_registered()
     test_display_geometry()
+    test_capture_saves_to_persistent_screenshots_dir()
     from tempfile import TemporaryDirectory
     from pathlib import Path
     with TemporaryDirectory() as tmp:

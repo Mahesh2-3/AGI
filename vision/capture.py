@@ -23,26 +23,14 @@ class ScreenCaptureEngine:
     def __init__(self):
         self.persistent_dir = PERSISTENT_SCREENSHOTS_DIR
         self.persistent_dir.mkdir(parents=True, exist_ok=True)
+        # Store screenshots directly in workspace screenshots folder
+        self.screenshots_dir = self.persistent_dir
         self.ram_dir = RAM_DISK_DIR
-        if self.ram_dir:
-            self.ram_dir.mkdir(parents=True, exist_ok=True)
-        self.screenshots_dir = self.ram_dir if self.ram_dir else self.persistent_dir
         self.has_grim = bool(shutil.which("grim"))
 
     def _cleanup_old_ram_frames(self, max_frames: int = 20):
-        """Maintains low memory footprint on RAM disk by keeping only recent frames."""
-        if not self.ram_dir or not self.ram_dir.exists():
-            return
-        try:
-            frames = sorted(self.ram_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
-            if len(frames) > max_frames:
-                for f in frames[:-max_frames]:
-                    try:
-                        f.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        """Preserves all captured screenshot history without deletion."""
+        pass
 
     def get_display_geometry(self) -> Dict[str, Any]:
         """Queries monitor resolution and active workspace."""
@@ -70,14 +58,12 @@ class ScreenCaptureEngine:
         output_path: Optional[str | Path] = None,
         include_cursor: bool = False,
         quality: int = 80,
-        persistent: bool = False,
+        persistent: bool = True,
     ) -> Dict[str, Any]:
-        """Captures full desktop screenshot."""
+        """Captures full desktop screenshot and saves to screenshots folder."""
         if not output_path:
-            self._cleanup_old_ram_frames()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-            target_dir = self.persistent_dir if persistent else self.screenshots_dir
-            output_path = target_dir / f"screen_{timestamp}.jpg"
+            output_path = self.persistent_dir / f"screen_{timestamp}.jpg"
         else:
             output_path = Path(output_path).resolve()
 
@@ -124,10 +110,8 @@ class ScreenCaptureEngine:
     ) -> Dict[str, Any]:
         """Captures a specific region of the screen (x, y, w, h)."""
         if not output_path:
-            self._cleanup_old_ram_frames()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-            target_dir = self.persistent_dir if persistent else self.screenshots_dir
-            output_path = target_dir / f"region_{timestamp}.jpg"
+            output_path = self.persistent_dir / f"region_{timestamp}.jpg"
         else:
             output_path = Path(output_path).resolve()
 
@@ -212,9 +196,9 @@ class ScreenCaptureEngine:
 capture_engine = ScreenCaptureEngine()
 
 
-@registry.register(description="Takes a high-speed screenshot of the user's desktop screen.")
-def take_screenshot(include_cursor: bool = False) -> Dict[str, Any]:
-    return capture_engine.capture_full_screen(include_cursor=include_cursor)
+@registry.register(description="Takes a high-speed screenshot of the user's desktop screen and saves it into the workspace screenshots folder.")
+def take_screenshot(include_cursor: bool = False, output_path: Optional[str] = None) -> Dict[str, Any]:
+    return capture_engine.capture_full_screen(output_path=output_path, include_cursor=include_cursor, persistent=True)
 
 
 @registry.register(description="Captures a screenshot of a specific application window by title or name.")
