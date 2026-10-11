@@ -219,6 +219,7 @@ class JarvisAgent:
                         # Ensure Jarvis's working workspace is active on the monitor before interacting
                         if fn_name in (
                             "click_element", "type_into_element", "click_coordinate", "move_mouse", "click_mouse",
+                            "move_to_element", "locate_element_by_image",
                             "type_text_input", "press_shortcut", "scroll_page",
                             "take_screenshot", "inspect_screen", "locate_element", "capture_window_screenshot",
                             "open_browser_in_workspace", "scan_webpage_dom", "click_webpage_element",

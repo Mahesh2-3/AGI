@@ -194,8 +194,103 @@ class VisualGroundingEngine:
             img.convert("RGB").save(buf, format="JPEG", quality=85)
             return buf.getvalue(), w, h
 
+    def locate_by_template(
+        self,
+        template_path: str | Path,
+        screenshot_path: Optional[str | Path] = None,
+        confidence: float = 0.8,
+    ) -> Dict[str, Any]:
+        """Method A: Locates a known button or icon on screen using template matching (PyAutoGUI / OpenCV)."""
+        template_p = Path(template_path)
+        if not template_p.exists():
+            return {
+                "found": False,
+                "error": f"Template image not found: {template_path}",
+            }
+
+        if not screenshot_path:
+            shot = capture_engine.capture_full_screen()
+            screenshot_p = Path(shot["path"])
+        else:
+            screenshot_p = Path(screenshot_path)
+
+        with Image.open(screenshot_p) as screen_img:
+            orig_w, orig_h = screen_img.size
+
+        # 1. Try PyAutoGUI / pyscreeze template matching
+        try:
+            import pyautogui
+            box = pyautogui.locate(str(template_p), str(screenshot_p), confidence=confidence)
+            if box is not None:
+                x1, y1 = box.left, box.top
+                x2, y2 = box.left + box.width, box.top + box.height
+                cx = round((x1 + x2) / 2)
+                cy = round((y1 + y2) / 2)
+                nx1, ny1 = round(x1 / orig_w, 4), round(y1 / orig_h, 4)
+                nx2, ny2 = round(x2 / orig_w, 4), round(y2 / orig_h, 4)
+                return {
+                    "found": True,
+                    "target": template_p.stem,
+                    "method": "image_matching",
+                    "bbox": [nx1, ny1, nx2, ny2],
+                    "bbox_pixels": [x1, y1, x2, y2],
+                    "x": cx,
+                    "y": cy,
+                    "confidence": confidence,
+                    "description": f"Image template '{template_p.name}' matched at center ({cx}, {cy})",
+                    "screen_width": orig_w,
+                    "screen_height": orig_h,
+                }
+        except Exception as e:
+            logger.debug(f"PyAutoGUI template matching skipped: {e}")
+
+        # 2. Try OpenCV template matching if available
+        try:
+            import cv2
+            import numpy as np
+            img_rgb = cv2.imread(str(screenshot_p))
+            template = cv2.imread(str(template_p))
+            if img_rgb is not None and template is not None:
+                h, w = template.shape[:2]
+                res = cv2.matchTemplate(img_rgb, template, cv2.TM_CCOEFF_NORMED)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                if max_val >= confidence:
+                    x1, y1 = max_loc[0], max_loc[1]
+                    x2, y2 = x1 + w, y1 + h
+                    cx = round((x1 + x2) / 2)
+                    cy = round((y1 + y2) / 2)
+                    return {
+                        "found": True,
+                        "target": template_p.stem,
+                        "method": "opencv_template_matching",
+                        "bbox": [round(x1 / orig_w, 4), round(y1 / orig_h, 4), round(x2 / orig_w, 4), round(y2 / orig_h, 4)],
+                        "bbox_pixels": [x1, y1, x2, y2],
+                        "x": cx,
+                        "y": cy,
+                        "confidence": round(float(max_val), 3),
+                        "description": f"OpenCV template matched at center ({cx}, {cy}) with score {round(float(max_val), 3)}",
+                        "screen_width": orig_w,
+                        "screen_height": orig_h,
+                    }
+        except Exception as e:
+            logger.debug(f"OpenCV template matching skipped: {e}")
+
+        return {
+            "found": False,
+            "error": f"Template image '{template_p.name}' not found on screen with confidence >= {confidence}.",
+            "screen_width": orig_w,
+            "screen_height": orig_h,
+        }
+
     def locate_element(self, query: str, screenshot_path: Optional[str | Path] = None) -> Dict[str, Any]:
-        """Locates pixel coordinates (x, y) of a UI element on the screen with VLM cascade."""
+        """Locates pixel coordinates (x, y) of a UI element on the screen using normalized bounding boxes."""
+        # Method A check: If query refers to an existing image file on disk, use image matching
+        clean_q = query.strip()
+        possible_img = clean_q[len("image:"):].strip() if clean_q.startswith("image:") else clean_q
+        possible_img = possible_img[len("template:"):].strip() if possible_img.startswith("template:") else possible_img
+        if Path(possible_img).is_file() and any(possible_img.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".bmp"]):
+            return self.locate_by_template(possible_img, screenshot_path=screenshot_path)
+
         if not screenshot_path:
             shot = capture_engine.capture_full_screen()
             image_path = Path(shot["path"])
@@ -207,18 +302,30 @@ class VisualGroundingEngine:
 
         img_bytes, orig_w, orig_h = self._prepare_image(image_path)
 
-        prompt = f"""You are a precise screen coordinate locator for a desktop AI assistant.
-Analyze this desktop screenshot (Resolution: {orig_w}x{orig_h}).
+        # Method B: Prompt vision model for normalized bounding box [x1, y1, x2, y2]
+        prompt = f"""You are the visual grounding component of a desktop AI assistant.
+The user will provide a screenshot (Resolution: {orig_w}x{orig_h}) and a target description.
 Target element to find: "{query}"
 
-Output ONLY a valid JSON object with these exact keys:
+Identify the exact target in the screenshot and return its bounding box as normalized coordinates between 0 and 1.
+Return ONLY valid JSON in this format:
 {{
-  "found": true or false,
-  "x": integer pixel coordinate (0 to {orig_w}) at the center of the element,
-  "y": integer pixel coordinate (0 to {orig_h}) at the center of the element,
-  "confidence": float between 0.0 and 1.0,
-  "description": "Clear description of the detected element"
+  "found": true,
+  "target": "{query}",
+  "bbox": [x1, y1, x2, y2],
+  "confidence": 0.95,
+  "description": "short description of the detected element"
 }}
+
+Rules:
+- Coordinates are relative to the original screenshot.
+- The origin (0, 0) is the top-left corner.
+- bbox contains the top-left and bottom-right corners [x1, y1, x2, y2] normalized between 0.0 and 1.0.
+- Locate the actual interactive control, not nearby text or decoration.
+- If multiple matching targets exist and the intended one is ambiguous, do not guess.
+- If the target is missing or obscured, return found=false and bbox=null.
+- Never invent coordinates.
+- Confidence is an estimate between 0.0 and 1.0, not proof that the location is correct.
 Do NOT output any markdown backticks or extra text outside the JSON object."""
 
         available_models = self.tracker.get_available_models()
@@ -415,7 +522,7 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
         raise ValueError(f"Unknown provider '{model_info.provider}'")
 
     def _parse_coordinate_response(self, text: str, max_w: int, max_h: int) -> Dict[str, Any]:
-        """Safely parses JSON coordinate block from model output."""
+        """Safely parses JSON coordinate block with normalized bounding box support."""
         try:
             cleaned = text.strip()
             if "```" in cleaned:
@@ -423,16 +530,107 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
                 if match:
                     cleaned = match.group(1)
             data = json.loads(cleaned)
-            # Clamp coordinates to screen bounds
-            if "x" in data:
-                data["x"] = max(0, min(max_w, int(data["x"])))
-            if "y" in data:
-                data["y"] = max(0, min(max_h, int(data["y"])))
-            return data
-        except Exception:
+
+            found = data.get("found", True)
+            if not found:
+                return {
+                    "found": False,
+                    "target": data.get("target") or "",
+                    "bbox": None,
+                    "bbox_pixels": None,
+                    "x": max_w // 2,
+                    "y": max_h // 2,
+                    "confidence": float(data.get("confidence", 0.0)),
+                    "description": data.get("description") or "Target element not found on screen.",
+                    "screen_width": max_w,
+                    "screen_height": max_h,
+                }
+
+            bbox = data.get("bbox")
+            # If normalized bbox [x1, y1, x2, y2] is returned
+            if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                raw_x1 = float(bbox[0])
+                raw_y1 = float(bbox[1])
+                raw_x2 = float(bbox[2])
+                raw_y2 = float(bbox[3])
+
+                # Check if model returned pixel values instead of normalized (e.g. > 1.0)
+                if raw_x2 > 1.0 or raw_y2 > 1.0 or raw_x1 > 1.0 or raw_y1 > 1.0:
+                    px1 = max(0, min(max_w, round(raw_x1)))
+                    py1 = max(0, min(max_h, round(raw_y1)))
+                    px2 = max(0, min(max_w, round(raw_x2)))
+                    py2 = max(0, min(max_h, round(raw_y2)))
+                    nx1 = round(px1 / max_w, 4)
+                    ny1 = round(py1 / max_h, 4)
+                    nx2 = round(px2 / max_w, 4)
+                    ny2 = round(py2 / max_h, 4)
+                else:
+                    nx1 = max(0.0, min(1.0, raw_x1))
+                    ny1 = max(0.0, min(1.0, raw_y1))
+                    nx2 = max(0.0, min(1.0, raw_x2))
+                    ny2 = max(0.0, min(1.0, raw_y2))
+                    px1 = round(nx1 * max_w)
+                    py1 = round(ny1 * max_h)
+                    px2 = round(nx2 * max_w)
+                    py2 = round(ny2 * max_h)
+
+                fx1, fx2 = min(px1, px2), max(px1, px2)
+                fy1, fy2 = min(py1, py2), max(py1, py2)
+
+                center_x = max(0, min(max_w, round((fx1 + fx2) / 2)))
+                center_y = max(0, min(max_h, round((fy1 + fy2) / 2)))
+
+                return {
+                    "found": True,
+                    "target": data.get("target") or data.get("description", ""),
+                    "bbox": [round(min(nx1, nx2), 4), round(min(ny1, ny2), 4), round(max(nx1, nx2), 4), round(max(ny1, ny2), 4)],
+                    "bbox_pixels": [fx1, fy1, fx2, fy2],
+                    "x": center_x,
+                    "y": center_y,
+                    "confidence": float(data.get("confidence", 0.95)),
+                    "description": data.get("description") or f"Detected at center ({center_x}, {center_y}) with box [{fx1}, {fy1}, {fx2}, {fy2}]",
+                    "screen_width": max_w,
+                    "screen_height": max_h,
+                }
+
+            # Backward compatibility if model returned direct x and y
+            if "x" in data and "y" in data:
+                raw_x = float(data["x"])
+                raw_y = float(data["y"])
+                if 0.0 <= raw_x <= 1.0 and 0.0 <= raw_y <= 1.0 and max_w > 1 and max_h > 1:
+                    cx = max(0, min(max_w, round(raw_x * max_w)))
+                    cy = max(0, min(max_h, round(raw_y * max_h)))
+                else:
+                    cx = max(0, min(max_w, int(raw_x)))
+                    cy = max(0, min(max_h, int(raw_y)))
+
+                return {
+                    "found": True,
+                    "target": data.get("target") or data.get("description", ""),
+                    "bbox": [round(cx / max_w, 4), round(cy / max_h, 4), round(cx / max_w, 4), round(cy / max_h, 4)],
+                    "bbox_pixels": [cx, cy, cx, cy],
+                    "x": cx,
+                    "y": cy,
+                    "confidence": float(data.get("confidence", 0.8)),
+                    "description": data.get("description") or f"Detected at coordinate ({cx}, {cy})",
+                    "screen_width": max_w,
+                    "screen_height": max_h,
+                }
+
             return {
                 "found": False,
-                "error": f"Failed to parse VLM response: {text[:200]}",
+                "error": f"Response did not contain valid bbox or coordinates: {text[:200]}",
+                "x": max_w // 2,
+                "y": max_h // 2,
+                "screen_width": max_w,
+                "screen_height": max_h,
+            }
+        except Exception as e:
+            return {
+                "found": False,
+                "error": f"Failed to parse VLM response: {e} (raw: {text[:200]})",
+                "x": max_w // 2,
+                "y": max_h // 2,
                 "screen_width": max_w,
                 "screen_height": max_h,
             }
@@ -441,9 +639,14 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
 grounding_engine = VisualGroundingEngine()
 
 
-@registry.register(description="Analyzes the screen and locates the pixel coordinates (x, y) of a target UI button, icon, link, or text.")
+@registry.register(description="Analyzes the screen and locates the normalized bounding box and pixel coordinates (x, y) of a target UI button, icon, link, or text.")
 def locate_element(element_description: str) -> Dict[str, Any]:
     return grounding_engine.locate_element(query=element_description)
+
+
+@registry.register(description="Locates a known button or UI icon on screen using template matching from an image file.")
+def locate_element_by_image(image_path: str, confidence: float = 0.8) -> Dict[str, Any]:
+    return grounding_engine.locate_by_template(template_path=image_path, confidence=confidence)
 
 
 @registry.register(

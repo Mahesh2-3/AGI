@@ -10,6 +10,7 @@ def test_navigator_tools_registered():
     assert "click_element" in names
     assert "type_into_element" in names
     assert "click_coordinate" in names
+    assert "move_to_element" in names
 
 
 def test_click_element_not_found():
@@ -22,17 +23,45 @@ def test_click_element_not_found():
 
 def test_click_element_closed_loop_success():
     with patch("gui_driver.navigator.grounding_engine.locate_element") as mock_locate, \
+         patch("gui_driver.navigator.controller.move_to") as mock_move, \
          patch("gui_driver.navigator.controller.click") as mock_click, \
          patch("gui_driver.navigator.diff_engine.compare_images") as mock_diff:
 
-        mock_locate.return_value = {"found": True, "x": 250, "y": 300, "confidence": 0.9}
+        mock_locate.return_value = {
+            "found": True,
+            "x": 250,
+            "y": 300,
+            "bbox": [0.13, 0.28, 0.15, 0.32],
+            "bbox_pixels": [240, 290, 260, 310],
+            "confidence": 0.9,
+        }
         mock_diff.return_value = {"changed": True, "summary": "UI updated in button region."}
 
         res = navigator.click_element("Submit button")
         assert res["success"] is True
         assert res["clicked_at"] == {"x": 250, "y": 300}
+        assert res["bbox"] == [0.13, 0.28, 0.15, 0.32]
         assert res["visual_change_detected"] is True
+        mock_move.assert_called_once_with(250, 300)
         mock_click.assert_called_once_with(250, 300, button="left")
+
+
+def test_move_to_element():
+    with patch("gui_driver.navigator.grounding_engine.locate_element") as mock_locate, \
+         patch("gui_driver.navigator.controller.move_to") as mock_move:
+
+        mock_locate.return_value = {
+            "found": True,
+            "x": 400,
+            "y": 500,
+            "bbox": [0.2, 0.4, 0.25, 0.45],
+            "confidence": 0.95,
+        }
+
+        res = navigator.move_to_element("Settings tab")
+        assert res["success"] is True
+        assert res["moved_to"] == {"x": 400, "y": 500}
+        mock_move.assert_called_once_with(400, 500)
 
 
 def test_click_element_no_visual_change_fails():

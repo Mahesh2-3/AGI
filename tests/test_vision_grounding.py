@@ -7,6 +7,7 @@ def test_vision_grounding_registered():
     names = [s["function"]["name"] for s in schemas]
 
     assert "locate_element" in names
+    assert "locate_element_by_image" in names
     assert "inspect_screen" in names
     assert "get_vlm_status" in names
 
@@ -53,23 +54,36 @@ def test_get_vlm_status_tool():
 def test_parse_coordinate_response():
     engine = VisualGroundingEngine()
 
+    # 1. Normalized bounding box test (user example: [0.69, 0.67, 0.92, 0.82])
+    bbox_json = '{"found": true, "target": "Save button", "bbox": [0.69, 0.67, 0.92, 0.82], "confidence": 0.95}'
+    parsed_bbox = engine._parse_coordinate_response(bbox_json, 1920, 1080)
+    assert parsed_bbox["found"] is True
+    # Center x: round(((0.69 + 0.92)/2) * 1920) = round(0.805 * 1920) = 1546
+    # Center y: round(((0.67 + 0.82)/2) * 1080) = round(0.745 * 1080) = 805
+    assert parsed_bbox["x"] == 1546
+    assert parsed_bbox["y"] == 805
+    assert parsed_bbox["bbox"] == [0.69, 0.67, 0.92, 0.82]
+    assert parsed_bbox["bbox_pixels"] == [1325, 724, 1766, 886]
+
+    # 2. Backward compatibility direct x and y
     raw_json = '{"found": true, "x": 450, "y": 320, "confidence": 0.95, "description": "Search button"}'
     parsed = engine._parse_coordinate_response(raw_json, 1920, 1080)
     assert parsed["found"] is True
     assert parsed["x"] == 450
     assert parsed["y"] == 320
 
-    # Test coordinate clamping to bounds
+    # 3. Coordinate clamping to bounds
     out_of_bounds = '{"found": true, "x": 2500, "y": -50, "confidence": 0.8}'
     clamped = engine._parse_coordinate_response(out_of_bounds, 1920, 1080)
     assert clamped["x"] == 1920
     assert clamped["y"] == 0
 
-    # Test markdown code block extraction
-    markdown_wrapped = '```json\n{"found": true, "x": 100, "y": 200, "confidence": 0.9}\n```'
+    # 4. Markdown code block extraction
+    markdown_wrapped = '```json\n{"found": true, "bbox": [0.1, 0.2, 0.3, 0.4], "confidence": 0.9}\n```'
     extracted = engine._parse_coordinate_response(markdown_wrapped, 1920, 1080)
-    assert extracted["x"] == 100
-    assert extracted["y"] == 200
+    assert extracted["x"] == round(0.2 * 1920)
+    assert extracted["y"] == round(0.3 * 1080)
+    assert extracted["bbox"] == [0.1, 0.2, 0.3, 0.4]
 
 
 def test_inspect_screen_with_user_prompt():

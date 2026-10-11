@@ -33,6 +33,7 @@ class SafetyEngine:
             "search_files", "grep_in_files", "list_open_windows", "list_running_processes",
             "get_audio_volume", "get_network_status", "open_path",
             "take_screenshot", "capture_window_screenshot", "locate_element",
+            "locate_element_by_image", "move_to_element",
             "inspect_screen", "check_visual_difference",
             "speak_message", "listen_to_user"
         )

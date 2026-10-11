@@ -50,7 +50,10 @@ class ClosedLoopNavigator:
         target_x = loc["x"]
         target_y = loc["y"]
 
-        # 3. Act: Move and click
+        # 3. Act: Smoothly move cursor to target center first, then click
+        controller.move_to(target_x, target_y)
+        time.sleep(0.08)
+
         if click_type == "double":
             controller.double_click(target_x, target_y)
         elif click_type == "right":
@@ -63,6 +66,8 @@ class ClosedLoopNavigator:
                 "success": True,
                 "element": element_description,
                 "clicked_at": {"x": target_x, "y": target_y},
+                "bbox": loc.get("bbox"),
+                "bbox_pixels": loc.get("bbox_pixels"),
                 "verified": False,
             }
 
@@ -76,6 +81,8 @@ class ClosedLoopNavigator:
                 "success": False,
                 "element": element_description,
                 "clicked_at": {"x": target_x, "y": target_y},
+                "bbox": loc.get("bbox"),
+                "bbox_pixels": loc.get("bbox_pixels"),
                 "verified": True,
                 "visual_change_detected": False,
                 "error": f"Clicked at ({target_x}, {target_y}) for '{element_description}', but no visual update was detected on screen. The interface did not react or the element was unclickable.",
@@ -87,10 +94,38 @@ class ClosedLoopNavigator:
             "success": True,
             "element": element_description,
             "clicked_at": {"x": target_x, "y": target_y},
+            "bbox": loc.get("bbox"),
+            "bbox_pixels": loc.get("bbox_pixels"),
             "verified": True,
             "visual_change_detected": True,
             "ui_update_summary": diff["summary"],
             "confidence": loc.get("confidence", 1.0),
+        }
+
+    def move_to_element(self, element_description: str) -> Dict[str, Any]:
+        """Locates an element on screen and moves the cursor to its center without clicking."""
+        baseline = capture_engine.capture_full_screen()
+        loc = grounding_engine.locate_element(element_description, screenshot_path=baseline["path"])
+        if not loc.get("found"):
+            return {
+                "success": False,
+                "element": element_description,
+                "error": f"Could not locate '{element_description}' on screen ({loc.get('description')}).",
+                "details": loc.get("description"),
+            }
+
+        target_x = loc["x"]
+        target_y = loc["y"]
+        controller.move_to(target_x, target_y)
+
+        return {
+            "success": True,
+            "element": element_description,
+            "moved_to": {"x": target_x, "y": target_y},
+            "bbox": loc.get("bbox"),
+            "bbox_pixels": loc.get("bbox_pixels"),
+            "confidence": loc.get("confidence", 1.0),
+            "message": f"Successfully moved cursor to center ({target_x}, {target_y}) of '{element_description}'.",
         }
 
     def click_coordinate(
@@ -179,4 +214,9 @@ def type_into_element(element_description: str, text: str, press_enter: bool = F
 @registry.register(description="Clicks directly at exact screen pixel coordinates (x, y) with visual verification. Ideal for clicking specific spots like browser address bars, tabs, or known coordinate targets.")
 def click_coordinate(x: int, y: int, button: str = "left", verify: bool = True) -> Dict[str, Any]:
     return navigator.click_coordinate(x, y, button=button, verify=verify)
+
+
+@registry.register(description="Visually finds a button, link, icon, or control on screen and moves the cursor to its center without clicking. Ideal for testing visual targeting precision.")
+def move_to_element(element_description: str) -> Dict[str, Any]:
+    return navigator.move_to_element(element_description)
 
