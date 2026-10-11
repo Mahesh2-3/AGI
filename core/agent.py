@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Any, Callable, Dict, List, Optional
 from core.fast_path import FastPathRouter
 from core.llm_client import LLMClient
@@ -43,6 +44,27 @@ class JarvisAgent:
         self.on_tool_result = on_tool_result
         self.on_workflow_plan = on_workflow_plan
         self.failed_operations: List[Dict[str, Any]] = []
+        self.last_step_duration: float = 0.0
+
+    @staticmethod
+    def format_duration(seconds: float) -> str:
+        """Formats execution duration into human-readable latency."""
+        if seconds < 1.0:
+            return f"{seconds:.2f}s ({int(seconds * 1000)}ms)"
+        elif seconds < 60.0:
+            return f"{seconds:.2f}s"
+        else:
+            mins = int(seconds // 60)
+            rem_sec = seconds % 60
+            return f"{mins}m {rem_sec:.1f}s ({seconds:.2f}s)"
+
+    def _append_timing(self, reply: str, start_time: float) -> str:
+        """Appends elapsed operation duration to the final response."""
+        elapsed = time.perf_counter() - start_time
+        self.last_step_duration = elapsed
+        timing_str = f"⏱️ *Operation completed in {self.format_duration(elapsed)}*"
+        clean_reply = reply.rstrip()
+        return f"{clean_reply}\n\n{timing_str}"
 
     def _build_system_prompt(self, user_query: Optional[str] = None) -> str:
         """Constructs system prompt augmented with proactive long-term memory & relevant recalled facts."""
@@ -143,6 +165,8 @@ class JarvisAgent:
 
     def step(self, user_input: str) -> str:
         """Processes a user input through the autonomous ReAct cycle."""
+        start_time = time.perf_counter()
+
         # Contextualize vision grounding and screen inspection with current user request
         grounding_engine.set_current_user_prompt(user_input)
 
@@ -150,9 +174,10 @@ class JarvisAgent:
         if self.enable_fast_path:
             fast_reply = self.fast_path.route(user_input)
             if fast_reply is not None:
+                timed_reply = self._append_timing(fast_reply, start_time)
                 self.messages.append({"role": "user", "content": user_input})
-                self.messages.append({"role": "assistant", "content": fast_reply})
-                return fast_reply
+                self.messages.append({"role": "assistant", "content": timed_reply})
+                return timed_reply
 
         # Display planned execution workflow upfront
         workflow_plan = self.generate_workflow_plan(user_input)
@@ -186,7 +211,10 @@ class JarvisAgent:
                 err_msg = f"Neural processing error: {e}"
                 if self.on_thought:
                     self.on_thought(err_msg)
-                return f"I encountered an error communicating with my cognitive backend: {e}"
+                return self._append_timing(
+                    f"I encountered an error communicating with my cognitive backend: {e}",
+                    start_time,
+                )
 
             choice = response.choices[0]
             message = choice.message
@@ -258,15 +286,20 @@ class JarvisAgent:
 
             # No tool calls: final answer produced
             content = message.content or ""
+            timed_reply = self._append_timing(content, start_time)
             self.messages.append({"role": "assistant", "content": content})
-            return content
+            return timed_reply
 
         if self.failed_operations:
             failure_lines = "\n".join([f"- **{f['tool']}**: {f['error']}" for f in self.failed_operations[-3:]])
-            return (
+            fail_msg = (
                 f"Sir, I was unable to complete the task because the following operations encountered issues:\n"
                 f"{failure_lines}\n\n"
                 f"Please let me know how you would like to proceed or if I should attempt an alternative method."
             )
+            return self._append_timing(fail_msg, start_time)
 
-        return "I have reached the maximum reasoning iterations for this task without reaching a final conclusion, Sir."
+        return self._append_timing(
+            "I have reached the maximum reasoning iterations for this task without reaching a final conclusion, Sir.",
+            start_time,
+        )

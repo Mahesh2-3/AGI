@@ -73,6 +73,8 @@ def test_react_loop_with_tool_call():
     reply = agent.step("Jarvis, what is your current status?")
 
     assert "All systems are currently running" in reply
+    assert "⏱️ *Operation completed in" in reply
+    assert agent.last_step_duration > 0
     assert len(called_tools) == 1
     assert called_tools[0][0] == "get_status"
     assert len(agent.messages) >= 4  # system, user, assistant(tool_call), tool, assistant(final)

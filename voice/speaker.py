@@ -66,8 +66,10 @@ class JarvisSpeaker:
 
     def _split_into_sentences(self, text: str) -> List[str]:
         """Splits markdown/text into clean, pronounceable sentences."""
+        # Strip timing footnote (⏱️ *Operation completed in ...*)
+        cleaned = re.sub(r"⏱️[^\n\.]*", "", text)
         # Strip markdown syntax (bold, italic, code blocks, bullet points)
-        cleaned = re.sub(r"```[\s\S]*?```", "", text)
+        cleaned = re.sub(r"```[\s\S]*?```", "", cleaned)
         cleaned = re.sub(r"`[^`]+`", "", cleaned)
         cleaned = re.sub(r"[\*\_#>\-]", "", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
