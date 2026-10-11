@@ -151,7 +151,20 @@ def test_agent_workflow_plan_generation():
     assert "High-Speed Navigation" in web_plan
     assert "DOM Scanning" in web_plan
 
-    # Test callback is triggered in step
+    # Perception query detection
+    see_plan = agent.generate_workflow_plan("Sir > tell me what are you seeing on the screen")
+    assert "Visual Screen Capture" in see_plan
+    assert "Context-Aware Perception" in see_plan
+
+    # Existing window directive detection
+    existing_win_plan = agent.generate_workflow_plan(
+        "the web browser that is currently opened, type 'hello', don't open new web session"
+    )
+    assert "Window Identification" in existing_win_plan
+    assert "Contextual Action Dispatch" in existing_win_plan
+
+    # Test callback is triggered in step and sets grounding_engine user prompt
+    from vision.grounding import grounding_engine
     planned_events = []
     mock_llm = MagicMock()
     mock_resp = MagicMock()
@@ -164,9 +177,11 @@ def test_agent_workflow_plan_generation():
         on_workflow_plan=lambda plan: planned_events.append(plan),
     )
 
-    agent_with_callback.step("open browser -> test")
+    test_input = "tell me what are you seeing on the screen"
+    agent_with_callback.step(test_input)
     assert len(planned_events) == 1
-    assert "Open browser" in planned_events[0]
+    assert "Visual Screen Capture" in planned_events[0]
+    assert grounding_engine.get_current_user_prompt() == test_input
 
 
 if __name__ == "__main__":

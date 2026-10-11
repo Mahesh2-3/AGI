@@ -7,6 +7,7 @@ from core.safety import SafetyEngine
 from core.workspace import workspace_manager
 from memory.store import MemoryStore, memory_store as default_memory_store
 from tools.base import ToolRegistry, ToolResult, registry as default_registry
+from vision.grounding import grounding_engine
 
 
 class JarvisAgent:
@@ -92,6 +93,20 @@ class JarvisAgent:
                 steps.append(f"{idx}. **{part.capitalize()}**")
             return "\n".join(steps)
 
+        # Visual Perception / Screen Inspection
+        if any(w in prompt_lower for w in ["what are you seeing", "what do you see", "see on the screen", "inspect screen", "look at the screen", "read screen", "screen description"]):
+            steps.append("1. **Visual Screen Capture**: Capture high-resolution screenshot of current display.")
+            steps.append("2. **Context-Aware Perception**: Condition VLM inspection directly on user's query.")
+            steps.append("3. **Insight Delivery**: Present focused visual observations and findings.")
+            return "\n".join(steps)
+
+        # Existing Open Window / Desktop Interaction (e.g. "don't open new web session", "already opened", "currently open")
+        if any(phrase in prompt_lower for phrase in ["don't open new", "do not open new", "already opened", "already open", "currently open", "existing window"]):
+            steps.append("1. **Window Identification**: Locate and focus existing desktop application/browser window.")
+            steps.append("2. **Contextual Action Dispatch**: Direct native inputs and clicks into active window.")
+            steps.append("3. **State Verification**: Confirm interaction outcome without launching duplicate sessions.")
+            return "\n".join(steps)
+
         # Workspace / isolation
         if "new workspace" in prompt_lower or "workspace" in prompt_lower:
             steps.append("1. **Workspace Routing**: Switch to a designated desktop workspace for isolation.")
@@ -128,6 +143,9 @@ class JarvisAgent:
 
     def step(self, user_input: str) -> str:
         """Processes a user input through the autonomous ReAct cycle."""
+        # Contextualize vision grounding and screen inspection with current user request
+        grounding_engine.set_current_user_prompt(user_input)
+
         # Ultra-fast reflex route for common system tasks (<15ms)
         if self.enable_fast_path:
             fast_reply = self.fast_path.route(user_input)
@@ -220,10 +238,11 @@ class JarvisAgent:
                     if self.on_tool_result:
                         self.on_tool_result(fn_name, result.output if result.success else result.error, result.success)
 
-                    # Truncate overly long tool outputs to 600 chars to conserve Groq TPM
+                    # Preserve rich perception outputs (inspect_screen, DOM, windows) while guarding against massive outputs
                     clean_content = result.to_message_content()
-                    if len(clean_content) > 600:
-                        clean_content = clean_content[:600] + "... [truncated to prevent rate limit]"
+                    max_chars = 3500 if fn_name in ("inspect_screen", "scan_webpage_dom", "list_open_windows", "read_file") else 2500
+                    if len(clean_content) > max_chars:
+                        clean_content = clean_content[:max_chars] + "... [truncated to prevent token overflow]"
 
                     # Append tool execution result
                     self.messages.append({

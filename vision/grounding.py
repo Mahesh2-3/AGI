@@ -169,6 +169,14 @@ class VisualGroundingEngine:
         self.groq_api_key = self.groq_api_keys[0] if self.groq_api_keys else (settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY"))
         self.google_api_key = settings.GOOGLE_API_KEY or os.environ.get("GOOGLE_API_KEY")
         self.openai_api_key = settings.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY")
+        self._current_user_prompt: Optional[str] = None
+
+    def set_current_user_prompt(self, prompt: Optional[str]) -> None:
+        """Sets the active user prompt/intent to contextualize screen inspections."""
+        self._current_user_prompt = prompt
+
+    def get_current_user_prompt(self) -> Optional[str]:
+        return self._current_user_prompt
 
     def _prepare_image(self, image_path: Path, max_dimension: int = 1920) -> Tuple[bytes, int, int]:
         """Loads, optionally resizes, and returns JPEG bytes and actual dimensions."""
@@ -209,7 +217,7 @@ Output ONLY a valid JSON object with these exact keys:
   "x": integer pixel coordinate (0 to {orig_w}) at the center of the element,
   "y": integer pixel coordinate (0 to {orig_h}) at the center of the element,
   "confidence": float between 0.0 and 1.0,
-  "description": "short description of the detected element"
+  "description": "Clear description of the detected element"
 }}
 Do NOT output any markdown backticks or extra text outside the JSON object."""
 
@@ -258,8 +266,15 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
             "vlm_availability": summary,
         }
 
-    def inspect_screen(self, screenshot_path: Optional[str | Path] = None) -> Dict[str, Any]:
-        """Provides a textual understanding of current desktop state with VLM cascade."""
+    def inspect_screen(
+        self,
+        screenshot_path: Optional[str | Path] = None,
+        user_prompt: Optional[str] = None,
+        focus: Optional[str] = None,
+        query: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Provides a context-aware textual understanding of current desktop state with VLM cascade."""
         if not screenshot_path:
             shot = capture_engine.capture_full_screen()
             image_path = Path(shot["path"])
@@ -268,13 +283,30 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
 
         img_bytes, orig_w, orig_h = self._prepare_image(image_path)
 
-        prompt = "Describe what is currently visible on this desktop screen. List active applications, visible windows, open web pages, and notable UI controls concisely."
+        base_prompt = (
+            "Describe what is currently visible on this desktop screen. "
+            "List active applications, visible windows, open web pages, and notable UI controls concisely."
+        )
+
+        target_prompt = user_prompt or focus or query or self._current_user_prompt
+        clean_intent = str(target_prompt).strip() if target_prompt and str(target_prompt).strip() else None
+
+        if clean_intent:
+            prompt = (
+                f"{base_prompt}\n\n"
+                f"USER REQUEST / INTENT: \"{clean_intent}\"\n"
+                f"Pay special attention to any UI elements, text, windows, tabs, or details relevant to this request. "
+                f"Specifically analyze and answer what the user is looking for based on what is visible on screen."
+            )
+        else:
+            prompt = base_prompt
 
         available_models = self.tracker.get_available_models()
         if not available_models:
             summary = self.tracker.get_availability_summary()
             return {
                 "description": f"Visual screen inspection unavailable: all VLMs in cooldown ({summary}).",
+                "user_intent": clean_intent,
                 "width": orig_w,
                 "height": orig_h,
                 "vlm_availability": summary,
@@ -283,11 +315,12 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
         last_error = None
         for model_info in available_models:
             try:
-                raw_text = self._call_vlm(model_info, prompt, img_bytes, max_tokens=400)
+                raw_text = self._call_vlm(model_info, prompt, img_bytes, max_tokens=500)
                 if raw_text:
                     self.tracker.mark_success(model_info.model_id)
                     return {
                         "description": raw_text.strip(),
+                        "user_intent": clean_intent,
                         "width": orig_w,
                         "height": orig_h,
                         "vlm_model_used": model_info.model_id,
@@ -305,6 +338,7 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
         summary = self.tracker.get_availability_summary()
         return {
             "description": f"Screen inspection failed across active models: {last_error}",
+            "user_intent": clean_intent,
             "width": orig_w,
             "height": orig_h,
             "vlm_availability": summary,
@@ -412,9 +446,20 @@ def locate_element(element_description: str) -> Dict[str, Any]:
     return grounding_engine.locate_element(query=element_description)
 
 
-@registry.register(description="Visually inspects the user's screen and describes what is currently visible.")
-def inspect_screen() -> Dict[str, Any]:
-    return grounding_engine.inspect_screen()
+@registry.register(
+    description=(
+        "Visually inspects the user's screen and active desktop windows. "
+        "If user_prompt, focus, or query is provided, specifically analyzes and answers that need "
+        "in addition to providing general visible desktop state."
+    )
+)
+def inspect_screen(
+    user_prompt: Optional[str] = None,
+    focus: Optional[str] = None,
+    query: Optional[str] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    return grounding_engine.inspect_screen(user_prompt=user_prompt, focus=focus, query=query, **kwargs)
 
 
 @registry.register(description="Checks the health, cooldown state, and availability count of all configured Vision-Language Models (VLMs) (e.g. '4/4 VLMs available').")

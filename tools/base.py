@@ -49,6 +49,8 @@ class Tool:
         for param_name, param in sig.parameters.items():
             if param_name in ("self", "cls"):
                 continue
+            if param.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
+                continue
             annotation = param.default if param.annotation == inspect.Parameter.empty else param.annotation
             default_val = ... if param.default == inspect.Parameter.empty else param.default
             fields[param_name] = (annotation if annotation != inspect.Parameter.empty else Any, default_val)

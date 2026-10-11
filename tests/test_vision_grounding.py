@@ -72,9 +72,46 @@ def test_parse_coordinate_response():
     assert extracted["y"] == 200
 
 
+def test_inspect_screen_with_user_prompt():
+    engine = VisualGroundingEngine()
+    engine.set_current_user_prompt("what are you seeing on the screen")
+    assert engine.get_current_user_prompt() == "what are you seeing on the screen"
+
+    # Verify tool schema in registry
+    inspect_tool = registry.get_tool("inspect_screen")
+    assert inspect_tool is not None
+    props = inspect_tool.schema["function"]["parameters"]["properties"]
+    assert "user_prompt" in props
+    assert "focus" in props
+    assert "query" in props
+    assert "kwargs" not in props  # ensure **kwargs was not exposed in schema
+
+    # Mock _prepare_image and _call_vlm to verify prompt construction
+    captured_prompts = []
+
+    def mock_prepare_image(path):
+        return b"fake_jpeg", 1920, 1080
+
+    def mock_call_vlm(model_info, prompt, img_bytes, max_tokens=500):
+        captured_prompts.append(prompt)
+        return "I see VS Code and a Google Chrome browser open with ChatGPT."
+
+    engine._prepare_image = mock_prepare_image
+    engine._call_vlm = mock_call_vlm
+
+    res = engine.inspect_screen(screenshot_path="dummy.png", user_prompt="check ChatGPT input field")
+    assert res["description"] == "I see VS Code and a Google Chrome browser open with ChatGPT."
+    assert res["user_intent"] == "check ChatGPT input field"
+    assert len(captured_prompts) == 1
+    assert "Describe what is currently visible" in captured_prompts[0]
+    assert "USER REQUEST / INTENT: \"check ChatGPT input field\"" in captured_prompts[0]
+    assert "Specifically analyze and answer what the user is looking for" in captured_prompts[0]
+
+
 if __name__ == "__main__":
     test_vision_grounding_registered()
     test_vlm_health_tracker()
     test_get_vlm_status_tool()
     test_parse_coordinate_response()
+    test_inspect_screen_with_user_prompt()
     print("✅ All visual grounding and VLM tracker tests passed successfully!")

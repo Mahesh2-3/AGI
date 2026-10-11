@@ -206,7 +206,7 @@ def focus_browser_address_bar() -> Dict[str, Any]:
     }
 
 
-@registry.register(description="Focuses an active desktop window matching the given application name or title keyword. Automatically switches to the window's workspace if located on a different workspace.")
+@registry.register(description="Focuses an active desktop window matching the given application name, class, title keyword, or alias (e.g. 'browser', 'chrome', 'editor', 'ChatGPT'). Automatically switches to the window's workspace if on another workspace.")
 def focus_window(query: str, bring_to_current_workspace: bool = False) -> Dict[str, Any]:
     query_clean = query.strip().lower()
     if _is_hyprland():
@@ -216,12 +216,40 @@ def focus_window(query: str, bring_to_current_workspace: bool = False) -> Dict[s
             res = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, check=True)
             clients = json.loads(res.stdout)
             matching = None
+
+            # 1. Direct title or class substring match
             for c in clients:
                 title = (c.get("title") or "").lower()
                 cls = (c.get("class") or "").lower()
                 if query_clean in title or query_clean in cls:
                     matching = c
                     break
+
+            # 2. Alias resolution (e.g. 'browser' -> google-chrome, 'terminal' -> kitty, 'editor' -> code)
+            if not matching:
+                alias_candidates = []
+                for alias_key, candidate_list in COMMON_APP_ALIASES.items():
+                    if query_clean == alias_key or query_clean in alias_key or alias_key in query_clean:
+                        alias_candidates.extend(candidate_list)
+                if alias_candidates:
+                    for c in clients:
+                        cls = (c.get("class") or "").lower()
+                        title = (c.get("title") or "").lower()
+                        if any(cand in cls or cand in title for cand in alias_candidates):
+                            matching = c
+                            break
+
+            # 3. Web domain or service query fallback to any open browser
+            # e.g., if query is "ChatGPT", "chatgpt.com", "youtube", "chess" and tab title didn't match
+            if not matching:
+                is_web_query = any(w in query_clean for w in ["chatgpt", "google", "youtube", "chess", "github", "web", "browser"]) or any(ext in query_clean for ext in [".com", ".org", ".net", ".io"])
+                if is_web_query:
+                    browser_classes = COMMON_APP_ALIASES["browser"]
+                    for c in clients:
+                        cls = (c.get("class") or "").lower()
+                        if any(b in cls for b in browser_classes):
+                            matching = c
+                            break
 
             if matching:
                 win_ws = matching.get("workspace", {}).get("id", active_id)
@@ -254,6 +282,14 @@ def focus_window(query: str, bring_to_current_workspace: bool = False) -> Dict[s
                         "class": win_class,
                         "workspace": win_ws,
                     }
+
+            open_list = [f"'{c.get('title')}' ({c.get('class')})" for c in clients]
+            available_summary = ", ".join(open_list) if open_list else "None"
+            return {
+                "success": False,
+                "error": f"No open window found matching query '{query}'. Available open windows: [{available_summary}].",
+                "available_windows": open_list,
+            }
         except Exception as e:
             return {"success": False, "error": f"Failed while focusing window query '{query}': {e}"}
 
