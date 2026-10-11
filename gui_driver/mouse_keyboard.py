@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Mock mouseinfo to prevent tkinter requirement on headless/Linux setups
 if "mouseinfo" not in sys.modules:
