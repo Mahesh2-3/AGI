@@ -285,6 +285,11 @@ class JarvisAgent:
             choice = response.choices[0]
             message = choice.message
 
+            # If the model produced reasoning tokens (e.g. Qwen3 thinking), surface to thought callback
+            reasoning = getattr(message, "reasoning", None) or getattr(message, "thinking", None)
+            if reasoning and self.on_thought:
+                self.on_thought(str(reasoning).strip())
+
             # Check if the LLM invoked tools
             if hasattr(message, "tool_calls") and message.tool_calls:
                 # Add the assistant's tool-call request to the message history

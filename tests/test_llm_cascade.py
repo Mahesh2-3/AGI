@@ -100,7 +100,15 @@ def test_llm_client_multi_key_rotation():
     assert "rotating to alternate Groq key" in fallback_notes[0][2]
 
 
+def test_llm_client_default_ollama():
+    client = LLMClient()
+    assert client.provider == "ollama"
+    assert client.model == "qwen3:8b"
+    assert client.is_configured is True
+
+
 if __name__ == "__main__":
+    test_llm_client_default_ollama()
     test_llm_client_rate_limit_cascading()
     test_llm_client_non_rate_limit_error_not_swallowed()
     test_llm_client_cooldown()

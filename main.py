@@ -43,7 +43,10 @@ def display_welcome_banner():
     banner_text.append("Just A Rather Very Intelligent System\n", style="italic white")
     banner_text.append(f"Operating System: Linux (Session: {settings.WORKSPACE_DIR})\n", style="dim cyan")
     mem_count = len(memory_store.list_all())
-    banner_text.append(f"Active Provider: {settings.DEFAULT_PROVIDER.upper()} | Model: {settings.DEFAULT_MODEL} | Memory: {mem_count} items", style="dim green")
+    banner_text.append(
+        f"Neural Core: OLLAMA (Local GPU) | Reasoning: {settings.DEFAULT_MODEL} | Vision: {settings.OLLAMA_VLM_MODEL} | Memory: {mem_count} items",
+        style="dim green",
+    )
 
     console.print(Panel(banner_text, border_style="cyan", expand=False))
 
@@ -85,14 +88,32 @@ def main():
     display_welcome_banner()
 
     llm = LLMClient()
-    if not llm.is_configured:
+    if llm.provider == "ollama":
+        # Verify Ollama service is reachable
+        try:
+            import urllib.request
+            req = urllib.request.Request(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/tags")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.status == 200:
+                    console.print(
+                        f"[bold green]✓ Connected to Local GPU Neural Core[/bold green] "
+                        f"[dim](Reasoning: {settings.DEFAULT_MODEL} | Vision: {settings.OLLAMA_VLM_MODEL})[/dim]\n"
+                    )
+        except Exception as e:
+            console.print(
+                Panel(
+                    f"[bold red]⚠️ Ollama Connection Issue![/bold red]\n\n"
+                    f"Could not connect to Ollama at [bold cyan]{settings.OLLAMA_BASE_URL}[/bold cyan] ({e}).\n"
+                    "Make sure Ollama is running (`ollama serve`).\n",
+                    border_style="red",
+                    title="Neural Backend Offline",
+                )
+            )
+    elif not llm.is_configured:
         console.print(
             Panel(
                 "[bold yellow]⚠️ No API Key Detected![/bold yellow]\n\n"
-                "To connect Jarvis to his neural backend, set [bold cyan]GROQ_API_KEY[/bold cyan] or [bold cyan]OPENAI_API_KEY[/bold cyan] in your [bold white].env[/bold white] file.\n"
-                "Example:\n"
-                "  [green]GROQ_API_KEY=gsk_your_groq_api_key_here[/green]\n\n"
-                "[dim](Commands available without API key: 'tools', 'status', 'exit')[/dim]",
+                "Please configure your local Ollama setup or .env file.\n",
                 border_style="yellow",
                 title="Configuration Required",
             )

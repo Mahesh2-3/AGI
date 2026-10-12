@@ -46,9 +46,14 @@ class Settings:
 
         return keys
 
-    # Defaults
-    DEFAULT_PROVIDER: str = os.getenv("DEFAULT_PROVIDER", "groq")
-    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "llama-3.3-70b-versatile")
+    # Defaults (Local GPU Models via Ollama)
+    DEFAULT_PROVIDER: str = os.getenv("DEFAULT_PROVIDER", "ollama")
+    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "qwen3:8b")
+
+    # Local Ollama & Vision Configuration
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_VLM_MODEL: str = os.getenv("OLLAMA_VLM_MODEL", "qwen2.5vl:3b")
+    VISION_PROVIDER: str = os.getenv("VISION_PROVIDER", "ollama")
 
     # Persona
     ASSISTANT_NAME: str = os.getenv("ASSISTANT_NAME", "Jarvis")

@@ -69,6 +69,7 @@ def test_react_loop_with_tool_call():
         tool_registry=registry,
         on_tool_call=lambda name, args: called_tools.append((name, args)),
     )
+    agent._generate_workflow_via_llm = MagicMock(return_value=None)
 
     reply = agent.step("Jarvis, what is your current status?")
 

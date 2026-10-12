@@ -14,7 +14,7 @@ GROQ_CASCADE_MODELS = [
 
 
 class LLMClient:
-    """Manages connections to model providers (Groq, OpenAI, etc.) with automatic rate-limit failover cascading."""
+    """Manages connections to model providers (default: local Ollama qwen3:8b running on GPU)."""
 
     def __init__(
         self,
@@ -22,8 +22,9 @@ class LLMClient:
         model: Optional[str] = None,
         on_fallback: Optional[Callable[[str, str, str], None]] = None,
     ):
-        self.provider = (provider or settings.DEFAULT_PROVIDER).lower()
-        self.model = model or settings.DEFAULT_MODEL
+        self.provider = (provider or getattr(settings, "DEFAULT_PROVIDER", "ollama")).lower()
+        self.model = model or getattr(settings, "DEFAULT_MODEL", "qwen3:8b")
+        self.ollama_base_url = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
         self.on_fallback = on_fallback
         self._client = None
         self._groq_keys: List[str] = []
@@ -36,7 +37,6 @@ class LLMClient:
         self._model_cooldowns: Dict[str, float] = {}
         self._last_fallback_alert: Dict[str, float] = {}
 
-        # Build cascade list ensuring primary model is first
         if self.provider == "groq":
             self.model_cascade = [self.model] + [m for m in GROQ_CASCADE_MODELS if m != self.model]
         else:
@@ -58,7 +58,11 @@ class LLMClient:
         return ready if ready else cooling
 
     def _init_client(self):
-        if self.provider == "groq":
+        if self.provider == "ollama":
+            from openai import OpenAI
+            base_url = f"{self.ollama_base_url.rstrip('/')}/v1"
+            self._client = OpenAI(base_url=base_url, api_key="ollama")
+        elif self.provider == "groq":
             self._groq_keys = list(settings.GROQ_API_KEYS)
             if not self._groq_keys:
                 single = settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY")
@@ -79,16 +83,16 @@ class LLMClient:
             else:
                 self._client = None
         else:
-            api_key = settings.OPENAI_API_KEY or settings.GROQ_API_KEY
-            if api_key:
-                from openai import OpenAI
-                self._client = OpenAI(api_key=api_key)
-            else:
-                self._client = None
+            from openai import OpenAI
+            base_url = f"{self.ollama_base_url.rstrip('/')}/v1"
+            self._client = OpenAI(base_url=base_url, api_key="ollama")
 
     def _get_candidate_clients(self) -> List[tuple[str, Any]]:
         """Returns active clients prioritized by cooldown status with round-robin load distribution."""
         import time
+
+        if self.provider == "ollama":
+            return [("ollama", self._client)] if self._client else []
 
         # If _client was overridden by a test mock or custom object
         if self._client and (not self._groq_keys or self._client not in self._groq_clients.values()):
@@ -145,6 +149,10 @@ class LLMClient:
         """Sends chat request to the LLM backend with multi-key failover and model cascading."""
         clients = self._get_candidate_clients()
         if not clients:
+            if self.provider == "ollama":
+                raise RuntimeError(
+                    f"Local Ollama client not configured. Ensure Ollama is running at {self.ollama_base_url}."
+                )
             raise RuntimeError(
                 f"No API key found for provider '{self.provider}'. "
                 "Please configure GROQ_API_KEY (or multiple GROQ_API_KEYS) in your .env file."
@@ -237,6 +245,10 @@ class LLMClient:
         """Streams chat completion tokens with multi-key failover and model cascading."""
         clients = self._get_candidate_clients()
         if not clients:
+            if self.provider == "ollama":
+                raise RuntimeError(
+                    f"Local Ollama client not configured. Ensure Ollama is running at {self.ollama_base_url}."
+                )
             raise RuntimeError(
                 f"No API key found for provider '{self.provider}'. "
                 "Please configure GROQ_API_KEY in your .env file."
