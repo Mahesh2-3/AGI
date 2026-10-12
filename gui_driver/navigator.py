@@ -66,6 +66,7 @@ class ClosedLoopNavigator:
                 "success": True,
                 "element": element_description,
                 "clicked_at": {"x": target_x, "y": target_y},
+                "point": loc.get("point"),
                 "bbox": loc.get("bbox"),
                 "bbox_pixels": loc.get("bbox_pixels"),
                 "verified": False,
@@ -81,6 +82,7 @@ class ClosedLoopNavigator:
                 "success": False,
                 "element": element_description,
                 "clicked_at": {"x": target_x, "y": target_y},
+                "point": loc.get("point"),
                 "bbox": loc.get("bbox"),
                 "bbox_pixels": loc.get("bbox_pixels"),
                 "verified": True,
@@ -94,6 +96,7 @@ class ClosedLoopNavigator:
             "success": True,
             "element": element_description,
             "clicked_at": {"x": target_x, "y": target_y},
+            "point": loc.get("point"),
             "bbox": loc.get("bbox"),
             "bbox_pixels": loc.get("bbox_pixels"),
             "verified": True,
@@ -122,10 +125,11 @@ class ClosedLoopNavigator:
             "success": True,
             "element": element_description,
             "moved_to": {"x": target_x, "y": target_y},
+            "point": loc.get("point"),
             "bbox": loc.get("bbox"),
             "bbox_pixels": loc.get("bbox_pixels"),
             "confidence": loc.get("confidence", 1.0),
-            "message": f"Successfully moved cursor to center ({target_x}, {target_y}) of '{element_description}'.",
+            "message": f"Successfully moved cursor to point ({target_x}, {target_y}) of '{element_description}'.",
         }
 
     def click_coordinate(
