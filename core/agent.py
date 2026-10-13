@@ -493,6 +493,17 @@ class JarvisAgent:
                     fn_name = tool_call.function.name
                     raw_args = tool_call.function.arguments
 
+                    if abort_subsequent:
+                        # If a previous tool in this batch failed, skip execution
+                        # and append a dummy error result to satisfy LLM API requirements.
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": fn_name,
+                            "content": "Tool execution aborted because a previous tool in this batch failed. Please inspect the previous error.",
+                        })
+                        continue
+
                     try:
                         args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                     except json.JSONDecodeError:
@@ -576,6 +587,7 @@ class JarvisAgent:
                             "error": result.error,
                             "args": args,
                         })
+                        abort_subsequent = True
 
                     if self.on_tool_result:
                         try:
