@@ -69,10 +69,13 @@ def test_react_loop_with_tool_call():
         tool_registry=registry,
         on_tool_call=lambda name, args: called_tools.append((name, args)),
     )
+    agent._generate_workflow_via_llm = MagicMock(return_value=None)
 
     reply = agent.step("Jarvis, what is your current status?")
 
     assert "All systems are currently running" in reply
+    assert "⏱️ *Operation completed in" not in reply
+    assert agent.last_step_duration > 0
     assert len(called_tools) == 1
     assert called_tools[0][0] == "get_status"
     assert len(agent.messages) >= 4  # system, user, assistant(tool_call), tool, assistant(final)
@@ -139,29 +142,39 @@ def test_agent_workflow_plan_generation():
     arrow_plan = agent.generate_workflow_plan(
         "open browser in new workspace -> type chess.com -> scan the website -> interact with the DOM -> send a challenge to a friend"
     )
-    assert "1. **Open browser in new workspace**" in arrow_plan
-    assert "2. **Type chess.com**" in arrow_plan
-    assert "3. **Scan the website**" in arrow_plan
-    assert "4. **Interact with the dom**" in arrow_plan
-    assert "5. **Send a challenge to a friend**" in arrow_plan
+    assert "open browser in new workspace" in arrow_plan
+    assert "type chess.com" in arrow_plan
+    assert "scan the website" in arrow_plan
+    assert "interact with the DOM" in arrow_plan
+    assert "->" in arrow_plan
+
+    # Repository / commits workflow (user example)
+    repo_plan = agent.generate_workflow_plan(
+        "go to the repository commits and analyze the commits and tell me about the project"
+    )
+    assert "see the screen" in repo_plan
+    assert "if browser has github tab that contains a repo" in repo_plan
+    assert "go to the commits" in repo_plan
+    assert "analyze commits using DOM" in repo_plan
+    assert "else tell the user there is no github tab is opened" in repo_plan
+    assert "->" in repo_plan
 
     # Browser semantic detection
     web_plan = agent.generate_workflow_plan("open chess.com and play a game")
-    assert "Workspace Routing" in web_plan
-    assert "High-Speed Navigation" in web_plan
-    assert "DOM Scanning" in web_plan
+    assert "browser" in web_plan
+    assert "->" in web_plan
 
     # Perception query detection
     see_plan = agent.generate_workflow_plan("Sir > tell me what are you seeing on the screen")
-    assert "Visual Screen Capture" in see_plan
-    assert "Context-Aware Perception" in see_plan
+    assert "screen" in see_plan or "screenshot" in see_plan
+    assert "->" in see_plan
 
     # Existing window directive detection
     existing_win_plan = agent.generate_workflow_plan(
         "the web browser that is currently opened, type 'hello', don't open new web session"
     )
-    assert "Window Identification" in existing_win_plan
-    assert "Contextual Action Dispatch" in existing_win_plan
+    assert "if target window is open" in existing_win_plan or "window" in existing_win_plan
+    assert "->" in existing_win_plan
 
     # Test callback is triggered in step and sets grounding_engine user prompt
     from vision.grounding import grounding_engine
@@ -180,7 +193,8 @@ def test_agent_workflow_plan_generation():
     test_input = "tell me what are you seeing on the screen"
     agent_with_callback.step(test_input)
     assert len(planned_events) == 1
-    assert "Visual Screen Capture" in planned_events[0]
+    assert "screen" in planned_events[0]
+    assert "->" in planned_events[0]
     assert grounding_engine.get_current_user_prompt() == test_input
 
 

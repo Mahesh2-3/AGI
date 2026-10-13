@@ -1,9 +1,12 @@
+import logging
 import sys
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
 from rich.markdown import Markdown
+
+logger = logging.getLogger("JARVIS.CLI")
 
 from config.settings import settings
 from core.agent import JarvisAgent
@@ -40,7 +43,10 @@ def display_welcome_banner():
     banner_text.append("Just A Rather Very Intelligent System\n", style="italic white")
     banner_text.append(f"Operating System: Linux (Session: {settings.WORKSPACE_DIR})\n", style="dim cyan")
     mem_count = len(memory_store.list_all())
-    banner_text.append(f"Active Provider: {settings.DEFAULT_PROVIDER.upper()} | Model: {settings.DEFAULT_MODEL} | Memory: {mem_count} items", style="dim green")
+    banner_text.append(
+        f"Neural Core: OLLAMA (Local GPU) | Reasoning: {settings.DEFAULT_MODEL} | Vision: {settings.OLLAMA_VLM_MODEL} | Memory: {mem_count} items",
+        style="dim green",
+    )
 
     console.print(Panel(banner_text, border_style="cyan", expand=False))
 
@@ -82,26 +88,46 @@ def main():
     display_welcome_banner()
 
     llm = LLMClient()
-    if not llm.is_configured:
+    if llm.provider == "ollama":
+        # Verify Ollama service is reachable
+        try:
+            import urllib.request
+            req = urllib.request.Request(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/tags")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.status == 200:
+                    console.print(
+                        f"[bold green]✓ Connected to Local GPU Neural Core[/bold green] "
+                        f"[dim](Reasoning: {settings.DEFAULT_MODEL} | Vision: {settings.OLLAMA_VLM_MODEL})[/dim]\n"
+                    )
+        except Exception as e:
+            console.print(
+                Panel(
+                    f"[bold red]⚠️ Ollama Connection Issue![/bold red]\n\n"
+                    f"Could not connect to Ollama at [bold cyan]{settings.OLLAMA_BASE_URL}[/bold cyan] ({e}).\n"
+                    "Make sure Ollama is running (`ollama serve`).\n",
+                    border_style="red",
+                    title="Neural Backend Offline",
+                )
+            )
+    elif not llm.is_configured:
         console.print(
             Panel(
                 "[bold yellow]⚠️ No API Key Detected![/bold yellow]\n\n"
-                "To connect Jarvis to his neural backend, set [bold cyan]GROQ_API_KEY[/bold cyan] or [bold cyan]OPENAI_API_KEY[/bold cyan] in your [bold white].env[/bold white] file.\n"
-                "Example:\n"
-                "  [green]GROQ_API_KEY=gsk_your_groq_api_key_here[/green]\n\n"
-                "[dim](Commands available without API key: 'tools', 'status', 'exit')[/dim]",
+                "Please configure your local Ollama setup or .env file.\n",
                 border_style="yellow",
                 title="Configuration Required",
             )
         )
 
     def on_thought(thought: str):
-        console.print(f"[dim italic cyan]⚡ {thought}[/dim italic cyan]")
+        # Log internal thinking rather than printing raw tokens to terminal
+        logger.debug("Jarvis Thought: %s", thought)
 
     def on_workflow_plan(plan: str):
+        formatted_plan = plan.replace(" -> ", " [bold cyan]➔[/bold cyan] ")
         console.print(
             Panel(
-                Markdown(plan),
+                formatted_plan,
                 title="📋 [bold cyan]Planned Execution Flow[/bold cyan]",
                 border_style="cyan",
                 expand=False,
@@ -111,9 +137,16 @@ def main():
     def on_tool_call(name: str, args: dict):
         console.print(f"[bold cyan]⚡ Calling Tool:[/bold cyan] [yellow]{name}[/yellow] [dim]args={args}[/dim]")
 
-    def on_tool_result(name: str, output: any, success: bool):
+    def on_tool_result(name: str, output: any, success: bool, duration: float = 0.0):
         status_symbol = "[bold green]✓[/bold green]" if success else "[bold red]✗[/bold red]"
-        console.print(f"  {status_symbol} [dim green]Result from {name}:[/dim green] [dim]{str(output)[:200]}...[/dim]")
+        if duration > 0:
+            if duration >= 1.0:
+                time_str = f" [bold yellow]({duration:.2f}s)[/bold yellow]"
+            else:
+                time_str = f" [bold yellow]({int(duration * 1000)}ms)[/bold yellow]"
+        else:
+            time_str = ""
+        console.print(f"  {status_symbol} [dim green]Result from {name}{time_str}:[/dim green] [dim]{str(output)[:200]}...[/dim]")
 
     active_status = None
     current_turn_voice = False

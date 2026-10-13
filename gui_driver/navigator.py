@@ -17,23 +17,6 @@ class ClosedLoopNavigator:
         verify: bool = True,
     ) -> Dict[str, Any]:
         """Locates an element on screen, executes mouse click, and verifies visual update."""
-        # 0. Fast-path: If browser DOM driver has an active page and matches
-        try:
-            from tools.browser_dom import browser_driver
-            if browser_driver._page and not browser_driver._page.is_closed():
-                dom_res = browser_driver.click_element_by_text(element_description)
-                if dom_res.get("success"):
-                    return {
-                        "success": True,
-                        "element": element_description,
-                        "method": "browser_dom",
-                        "verified": True,
-                        "visual_change_detected": True,
-                        "details": dom_res,
-                    }
-        except Exception:
-            pass
-
         # 1. Observe: Capture baseline frame
         baseline = capture_engine.capture_full_screen()
 
@@ -66,6 +49,7 @@ class ClosedLoopNavigator:
                 "success": True,
                 "element": element_description,
                 "clicked_at": {"x": target_x, "y": target_y},
+                "point": loc.get("point"),
                 "bbox": loc.get("bbox"),
                 "bbox_pixels": loc.get("bbox_pixels"),
                 "verified": False,
@@ -81,6 +65,7 @@ class ClosedLoopNavigator:
                 "success": False,
                 "element": element_description,
                 "clicked_at": {"x": target_x, "y": target_y},
+                "point": loc.get("point"),
                 "bbox": loc.get("bbox"),
                 "bbox_pixels": loc.get("bbox_pixels"),
                 "verified": True,
@@ -94,6 +79,7 @@ class ClosedLoopNavigator:
             "success": True,
             "element": element_description,
             "clicked_at": {"x": target_x, "y": target_y},
+            "point": loc.get("point"),
             "bbox": loc.get("bbox"),
             "bbox_pixels": loc.get("bbox_pixels"),
             "verified": True,
@@ -122,10 +108,11 @@ class ClosedLoopNavigator:
             "success": True,
             "element": element_description,
             "moved_to": {"x": target_x, "y": target_y},
+            "point": loc.get("point"),
             "bbox": loc.get("bbox"),
             "bbox_pixels": loc.get("bbox_pixels"),
             "confidence": loc.get("confidence", 1.0),
-            "message": f"Successfully moved cursor to center ({target_x}, {target_y}) of '{element_description}'.",
+            "message": f"Successfully moved cursor to point ({target_x}, {target_y}) of '{element_description}'.",
         }
 
     def click_coordinate(

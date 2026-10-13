@@ -77,6 +77,16 @@ class Tool:
     def execute(self, **kwargs) -> ToolResult:
         """Executes the tool with parameter filtering and error handling."""
         try:
+            # Flatten nested arguments/parameters dictionaries from Qwen/Ollama models
+            if "arguments" in kwargs and isinstance(kwargs["arguments"], dict):
+                nested = kwargs["arguments"]
+                extra = {k: v for k, v in kwargs.items() if k not in ("arguments", "function", "name")}
+                kwargs = {**nested, **extra}
+            elif "parameters" in kwargs and isinstance(kwargs["parameters"], dict):
+                nested = kwargs["parameters"]
+                extra = {k: v for k, v in kwargs.items() if k not in ("parameters", "function", "name")}
+                kwargs = {**nested, **extra}
+
             sig = inspect.signature(self.func)
             has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
             if has_var_keyword:

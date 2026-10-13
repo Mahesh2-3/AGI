@@ -46,56 +46,16 @@ class VLMHealthTracker:
 
     def _initialize_models(self):
         self.models.clear()
-        groq_keys = settings.GROQ_API_KEYS
-        groq_key = groq_keys[0] if groq_keys else (settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY"))
-        google_key = settings.GOOGLE_API_KEY or os.environ.get("GOOGLE_API_KEY")
-        openai_key = settings.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY")
-
-        if groq_key:
-            self.models.append(
-                VLMModelInfo(
-                    model_id="groq:qwen/qwen3.8-27b",
-                    provider="groq",
-                    model_name="qwen/qwen3.8-27b",
-                    description="Groq Qwen 2.5 27B Vision",
-                )
+        # Local GPU-accelerated Qwen 2.5-VL via Ollama (Zero cloud dependencies)
+        ollama_model = getattr(settings, "OLLAMA_VLM_MODEL", "qwen2.5vl:3b")
+        self.models.append(
+            VLMModelInfo(
+                model_id=f"ollama:{ollama_model}",
+                provider="ollama",
+                model_name=ollama_model,
+                description=f"Local Qwen 2.5 VL ({ollama_model} on GPU)",
             )
-
-        if google_key:
-            self.models.append(
-                VLMModelInfo(
-                    model_id="google:gemini-3.5-flash-lite",
-                    provider="google",
-                    model_name="gemini-3.5-flash-lite",
-                    description="Google Gemini 3.5 Flash-Lite",
-                )
-            )
-            self.models.append(
-                VLMModelInfo(
-                    model_id="google:gemini-3.1-flash-lite",
-                    provider="google",
-                    model_name="gemini-3.1-flash-lite",
-                    description="Google Gemini 3.1 Flash-Lite",
-                )
-            )
-            self.models.append(
-                VLMModelInfo(
-                    model_id="google:gemini-flash-lite-latest",
-                    provider="google",
-                    model_name="gemini-flash-lite-latest",
-                    description="Google Gemini Flash-Lite Latest",
-                )
-            )
-
-        if openai_key:
-            self.models.append(
-                VLMModelInfo(
-                    model_id="openai:gpt-4o-mini",
-                    provider="openai",
-                    model_name="gpt-4o-mini",
-                    description="OpenAI GPT-4o Mini Vision",
-                )
-            )
+        )
 
     def mark_rate_limited(self, model_id: str, cooldown_seconds: float = 60.0):
         for m in self.models:
@@ -165,6 +125,8 @@ class VisualGroundingEngine:
 
     def __init__(self, tracker: Optional[VLMHealthTracker] = None):
         self.tracker = tracker or vlm_tracker
+        self.ollama_base_url = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
+        self.ollama_vlm_model = getattr(settings, "OLLAMA_VLM_MODEL", "qwen2.5vl:3b")
         self.groq_api_keys = list(settings.GROQ_API_KEYS)
         self.groq_api_key = self.groq_api_keys[0] if self.groq_api_keys else (settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY"))
         self.google_api_key = settings.GOOGLE_API_KEY or os.environ.get("GOOGLE_API_KEY")
@@ -178,7 +140,7 @@ class VisualGroundingEngine:
     def get_current_user_prompt(self) -> Optional[str]:
         return self._current_user_prompt
 
-    def _prepare_image(self, image_path: Path, max_dimension: int = 1920) -> Tuple[bytes, int, int]:
+    def _prepare_image(self, image_path: Path, max_dimension: int = 1280) -> Tuple[bytes, int, int]:
         """Loads, optionally resizes, and returns JPEG bytes and actual dimensions."""
         with Image.open(image_path) as img:
             w, h = img.size
@@ -208,6 +170,27 @@ class VisualGroundingEngine:
                 "error": f"Template image not found: {template_path}",
             }
 
+        try:
+            with Image.open(template_p) as t_img:
+                tw, th = t_img.size
+        except Exception as e:
+            return {
+                "found": False,
+                "error": f"Failed to open template image '{template_path}': {e}",
+            }
+
+        # Guard: Reject full-screen desktop screenshots passed as template images
+        if tw >= 800 and th >= 600:
+            return {
+                "found": False,
+                "error": (
+                    f"Invalid template image: '{template_p.name}' is {tw}x{th} (full-screen screenshot). "
+                    "locate_element_by_image is strictly for small cropped icon or button templates. "
+                    "To find or click UI elements visible on the screen, use click_element(element_description) "
+                    "or locate_element(element_description)."
+                ),
+            }
+
         if not screenshot_path:
             shot = capture_engine.capture_full_screen()
             screenshot_p = Path(shot["path"])
@@ -217,10 +200,10 @@ class VisualGroundingEngine:
         with Image.open(screenshot_p) as screen_img:
             orig_w, orig_h = screen_img.size
 
-        # 1. Try PyAutoGUI / pyscreeze template matching
+        # 1. Try pyscreeze template matching directly (pure Pillow, no Tkinter dependency)
         try:
-            import pyautogui
-            box = pyautogui.locate(str(template_p), str(screenshot_p), confidence=confidence)
+            import pyscreeze
+            box = pyscreeze.locate(str(template_p), str(screenshot_p))
             if box is not None:
                 x1, y1 = box.left, box.top
                 x2, y2 = box.left + box.width, box.top + box.height
@@ -241,8 +224,8 @@ class VisualGroundingEngine:
                     "screen_width": orig_w,
                     "screen_height": orig_h,
                 }
-        except Exception as e:
-            logger.debug(f"PyAutoGUI template matching skipped: {e}")
+        except (Exception, SystemExit) as e:
+            logger.debug(f"Pyscreeze template matching skipped: {e}")
 
         # 2. Try OpenCV template matching if available
         try:
@@ -302,30 +285,33 @@ class VisualGroundingEngine:
 
         img_bytes, orig_w, orig_h = self._prepare_image(image_path)
 
-        # Method B: Prompt vision model for normalized bounding box [x1, y1, x2, y2]
+        # Method B: Prompt vision model for bounding box [x1, y1, x2, y2] and bounded click point [x, y]
         prompt = f"""You are the visual grounding component of a desktop AI assistant.
 The user will provide a screenshot (Resolution: {orig_w}x{orig_h}) and a target description.
 Target element to find: "{query}"
 
-Identify the exact target in the screenshot and return its bounding box as normalized coordinates between 0 and 1.
+Identify the exact target button, link, icon, tab, or input field on screen.
+Return its bounding box and the precise bounded point to click.
 Return ONLY valid JSON in this format:
 {{
   "found": true,
   "target": "{query}",
   "bbox": [x1, y1, x2, y2],
+  "point": [x, y],
   "confidence": 0.95,
   "description": "short description of the detected element"
 }}
 
 Rules:
-- Coordinates are relative to the original screenshot.
+- Coordinates are relative to the screenshot (Resolution: {orig_w}x{orig_h}).
 - The origin (0, 0) is the top-left corner.
-- bbox contains the top-left and bottom-right corners [x1, y1, x2, y2] normalized between 0.0 and 1.0.
-- Locate the actual interactive control, not nearby text or decoration.
+- bbox contains the top-left and bottom-right corners [x1, y1, x2, y2] of the element boundary.
+- point contains the optimal click point [x, y] inside the button, control, or input field (preferably near its center).
+- Locate the actual interactive control (button, input, link, tab), not nearby decoration or background.
 - If multiple matching targets exist and the intended one is ambiguous, do not guess.
-- If the target is missing or obscured, return found=false and bbox=null.
+- If the target is missing, not visible, or obscured, return found=false, bbox=null, and point=null.
 - Never invent coordinates.
-- Confidence is an estimate between 0.0 and 1.0, not proof that the location is correct.
+- Confidence is an estimate between 0.0 and 1.0.
 Do NOT output any markdown backticks or extra text outside the JSON object."""
 
         available_models = self.tracker.get_available_models()
@@ -345,7 +331,7 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
         last_error = None
         for model_info in available_models:
             try:
-                raw_text = self._call_vlm(model_info, prompt, img_bytes)
+                raw_text = self._call_vlm(model_info, prompt, img_bytes, max_tokens=300, json_format=True)
                 if raw_text:
                     parsed = self._parse_coordinate_response(raw_text, orig_w, orig_h)
                     self.tracker.mark_success(model_info.model_id)
@@ -451,9 +437,66 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
             "vlm_availability": summary,
         }
 
-    def _call_vlm(self, model_info: VLMModelInfo, prompt: str, img_bytes: bytes, max_tokens: int = 250) -> str:
+    def _call_vlm(
+        self,
+        model_info: VLMModelInfo,
+        prompt: str,
+        img_bytes: bytes,
+        max_tokens: int = 250,
+        json_format: bool = False,
+    ) -> str:
         """Dispatches an inference request to the appropriate VLM provider."""
-        if model_info.provider == "groq":
+        if model_info.provider == "ollama":
+            import urllib.request
+            from core.model_manager import model_manager
+
+            # Ensure any loaded reasoning model is unloaded so VLM has dedicated VRAM
+            model_manager.prepare_for_model(model_info.model_name)
+
+            b64_img = base64.b64encode(img_bytes).decode("utf-8")
+            url = f"{self.ollama_base_url.rstrip('/')}/api/chat"
+            payload: Dict[str, Any] = {
+                "model": model_info.model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                        "images": [b64_img],
+                    }
+                ],
+                "stream": False,
+                "keep_alive": 0,  # Unload immediately after inference to prevent GPU memory/temperature spikes
+                "options": {
+                    "temperature": 0.0 if json_format else 0.2,
+                    "num_predict": max_tokens,
+                },
+            }
+            if json_format:
+                payload["format"] = "json"
+
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    return resp_data.get("message", {}).get("content", "")
+            except urllib.error.HTTPError as e:
+                err_detail = ""
+                try:
+                    err_detail = e.read().decode("utf-8")
+                except Exception:
+                    pass
+                raise RuntimeError(f"Ollama vision request failed [HTTP {e.code}]: {err_detail or e.reason}") from e
+            finally:
+                # Guarantee vision model is purged from GPU VRAM
+                model_manager.unload_model(model_info.model_name)
+
+        elif model_info.provider == "groq":
             from groq import Groq
             keys = self.groq_api_keys or ([self.groq_api_key] if self.groq_api_key else [])
             b64_img = base64.b64encode(img_bytes).decode("utf-8")
@@ -522,7 +565,7 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
         raise ValueError(f"Unknown provider '{model_info.provider}'")
 
     def _parse_coordinate_response(self, text: str, max_w: int, max_h: int) -> Dict[str, Any]:
-        """Safely parses JSON coordinate block with normalized bounding box support."""
+        """Safely parses JSON coordinate block with normalized bounding box and bounded click point support."""
         try:
             cleaned = text.strip()
             if "```" in cleaned:
@@ -538,6 +581,7 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
                     "target": data.get("target") or "",
                     "bbox": None,
                     "bbox_pixels": None,
+                    "point": None,
                     "x": max_w // 2,
                     "y": max_h // 2,
                     "confidence": float(data.get("confidence", 0.0)),
@@ -546,8 +590,25 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
                     "screen_height": max_h,
                 }
 
+            # Optional bounded point parsing: [px, py]
+            raw_pt = data.get("point")
+            click_point = None
+            if raw_pt and isinstance(raw_pt, (list, tuple)) and len(raw_pt) >= 2:
+                try:
+                    rpt_x = float(raw_pt[0])
+                    rpt_y = float(raw_pt[1])
+                    if rpt_x <= 1.0 and rpt_y <= 1.0 and max_w > 1 and max_h > 1:
+                        pt_x = max(0, min(max_w, round(rpt_x * max_w)))
+                        pt_y = max(0, min(max_h, round(rpt_y * max_h)))
+                    else:
+                        pt_x = max(0, min(max_w, round(rpt_x)))
+                        pt_y = max(0, min(max_h, round(rpt_y)))
+                    click_point = [pt_x, pt_y]
+                except (ValueError, TypeError):
+                    click_point = None
+
             bbox = data.get("bbox")
-            # If normalized bbox [x1, y1, x2, y2] is returned
+            # If bbox [x1, y1, x2, y2] is returned
             if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
                 raw_x1 = float(bbox[0])
                 raw_y1 = float(bbox[1])
@@ -580,15 +641,45 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
                 center_x = max(0, min(max_w, round((fx1 + fx2) / 2)))
                 center_y = max(0, min(max_h, round((fy1 + fy2) / 2)))
 
+                # Determine optimal bounded click coordinates:
+                # If a bounded point is specified and lies within the interior of the bounding box,
+                # use it for precise clicking. Otherwise, use the bounding box center.
+                if click_point and (fx1 < click_point[0] < fx2 and fy1 < click_point[1] < fy2):
+                    target_x, target_y = click_point[0], click_point[1]
+                else:
+                    target_x, target_y = center_x, center_y
+
+                bounded_point = click_point or [target_x, target_y]
+
                 return {
                     "found": True,
                     "target": data.get("target") or data.get("description", ""),
                     "bbox": [round(min(nx1, nx2), 4), round(min(ny1, ny2), 4), round(max(nx1, nx2), 4), round(max(ny1, ny2), 4)],
                     "bbox_pixels": [fx1, fy1, fx2, fy2],
-                    "x": center_x,
-                    "y": center_y,
+                    "point": bounded_point,
+                    "x": target_x,
+                    "y": target_y,
                     "confidence": float(data.get("confidence", 0.95)),
-                    "description": data.get("description") or f"Detected at center ({center_x}, {center_y}) with box [{fx1}, {fy1}, {fx2}, {fy2}]",
+                    "description": data.get("description") or f"Detected at point ({target_x}, {target_y}) with box [{fx1}, {fy1}, {fx2}, {fy2}]",
+                    "screen_width": max_w,
+                    "screen_height": max_h,
+                }
+
+            # If only point [x, y] was returned
+            if click_point:
+                target_x, target_y = click_point[0], click_point[1]
+                nx = round(target_x / max_w, 4)
+                ny = round(target_y / max_h, 4)
+                return {
+                    "found": True,
+                    "target": data.get("target") or data.get("description", ""),
+                    "bbox": [nx, ny, nx, ny],
+                    "bbox_pixels": [target_x, target_y, target_x, target_y],
+                    "point": click_point,
+                    "x": target_x,
+                    "y": target_y,
+                    "confidence": float(data.get("confidence", 0.9)),
+                    "description": data.get("description") or f"Detected at point ({target_x}, {target_y})",
                     "screen_width": max_w,
                     "screen_height": max_h,
                 }
@@ -609,6 +700,7 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
                     "target": data.get("target") or data.get("description", ""),
                     "bbox": [round(cx / max_w, 4), round(cy / max_h, 4), round(cx / max_w, 4), round(cy / max_h, 4)],
                     "bbox_pixels": [cx, cy, cx, cy],
+                    "point": [cx, cy],
                     "x": cx,
                     "y": cy,
                     "confidence": float(data.get("confidence", 0.8)),
@@ -644,9 +736,26 @@ def locate_element(element_description: str) -> Dict[str, Any]:
     return grounding_engine.locate_element(query=element_description)
 
 
-@registry.register(description="Locates a known button or UI icon on screen using template matching from an image file.")
-def locate_element_by_image(image_path: str, confidence: float = 0.8) -> Dict[str, Any]:
-    return grounding_engine.locate_by_template(template_path=image_path, confidence=confidence)
+@registry.register(
+    description=(
+        "[ICON CROP TEMPLATE MATCHING ONLY] Locates a small cropped icon or button template image on screen using OpenCV pixel matching. "
+        "DO NOT pass full-screen desktop screenshots here. For finding or clicking UI elements, buttons, or links visible on the screen, "
+        "always use click_element(element_description) or locate_element(element_description)."
+    )
+)
+def locate_element_by_image(
+    image_path: Optional[str] = None,
+    template_path: Optional[str] = None,
+    confidence: float = 0.8,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    target_path = image_path or template_path or kwargs.get("path")
+    if not target_path:
+        return {
+            "found": False,
+            "error": "Missing required image_path parameter for template matching.",
+        }
+    return grounding_engine.locate_by_template(template_path=target_path, confidence=confidence)
 
 
 @registry.register(

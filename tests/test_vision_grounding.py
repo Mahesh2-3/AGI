@@ -1,3 +1,4 @@
+import json
 from tools.base import registry
 from vision.grounding import VisualGroundingEngine, VLMHealthTracker, get_vlm_status, vlm_tracker
 
@@ -122,10 +123,69 @@ def test_inspect_screen_with_user_prompt():
     assert "Specifically analyze and answer what the user is looking for" in captured_prompts[0]
 
 
+def test_ollama_qwen_vlm_registered():
+    tracker = VLMHealthTracker()
+    model_ids = [m.model_id for m in tracker.models]
+    assert "ollama:qwen2.5vl:3b" in model_ids
+    # Groq should not be in tracker models when using ollama vision provider
+    assert not any(m.provider == "groq" for m in tracker.models)
+
+    first_model = tracker.models[0]
+    assert first_model.provider == "ollama"
+    assert first_model.model_name == "qwen2.5vl:3b"
+
+
+def test_parse_coordinate_response_with_bounded_point():
+    engine = VisualGroundingEngine()
+
+    # Bounded point inside pixel bbox
+    raw_json = json.dumps({
+        "found": True,
+        "target": "Submit button",
+        "bbox": [500, 300, 700, 350],
+        "point": [600, 325],
+        "confidence": 0.98,
+        "description": "Submit button at center"
+    })
+    parsed = engine._parse_coordinate_response(raw_json, 1920, 1080)
+    assert parsed["found"] is True
+    assert parsed["x"] == 600
+    assert parsed["y"] == 325
+    assert parsed["point"] == [600, 325]
+    assert parsed["bbox_pixels"] == [500, 300, 700, 350]
+
+    # Bounded point with edge point falls back safely to center
+    edge_json = json.dumps({
+        "found": True,
+        "target": "Input field",
+        "bbox": [100, 200, 300, 250],
+        "point": [300, 250],  # on edge
+        "confidence": 0.95,
+    })
+    parsed_edge = engine._parse_coordinate_response(edge_json, 1920, 1080)
+    assert parsed_edge["found"] is True
+    assert parsed_edge["x"] == 200  # center x
+    assert parsed_edge["y"] == 225  # center y
+
+    # Normalized point only
+    pt_only_json = json.dumps({
+        "found": True,
+        "target": "Icon",
+        "point": [0.5, 0.5],
+        "confidence": 0.9,
+    })
+    parsed_pt = engine._parse_coordinate_response(pt_only_json, 1920, 1080)
+    assert parsed_pt["found"] is True
+    assert parsed_pt["x"] == 960
+    assert parsed_pt["y"] == 540
+
+
 if __name__ == "__main__":
     test_vision_grounding_registered()
     test_vlm_health_tracker()
     test_get_vlm_status_tool()
     test_parse_coordinate_response()
     test_inspect_screen_with_user_prompt()
+    test_ollama_qwen_vlm_registered()
+    test_parse_coordinate_response_with_bounded_point()
     print("✅ All visual grounding and VLM tracker tests passed successfully!")

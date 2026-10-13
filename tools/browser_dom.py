@@ -83,7 +83,13 @@ class BrowserDOMDriver:
         if not self._page or self._page.is_closed():
             return {
                 "success": False,
-                "error": "No active browser page open. Call browser_navigate or open_browser_in_workspace first.",
+                "error": (
+                    "No automated Playwright browser session is active. "
+                    "CRITICAL: If you want to interact with an ALREADY OPEN window or application on the user's desktop "
+                    "(e.g., an open browser, code editor, or LeetCode tab), do NOT call Playwright tools! "
+                    "Instead, use Desktop GUI tools: 'focus_window(query)', 'inspect_screen()', "
+                    "'click_element(element_description)', 'type_text_input(text)', 'press_shortcut(hotkey)', or 'scroll_page()'."
+                ),
             }
 
         elements = self.get_interactive_elements(max_items=max_items)
@@ -126,7 +132,13 @@ class BrowserDOMDriver:
     def click_element_by_text(self, text: str) -> Dict[str, Any]:
         """Locates an element by visible text, label, or selector and clicks it directly via DOM."""
         if not self._page or self._page.is_closed():
-            raise RuntimeError("No active browser page open. Call navigate(url) first.")
+            raise RuntimeError(
+                "No automated Playwright browser session is active. "
+                "CRITICAL: If you want to interact with an ALREADY OPEN window or application on the user's desktop "
+                "(e.g., an open browser, code editor, or LeetCode tab), do NOT call click_webpage_element! "
+                "Instead, use Desktop GUI tools: 'focus_window(query)', 'inspect_screen()', "
+                "'click_element(element_description)', 'type_text_input(text)', 'press_shortcut(hotkey)', or 'scroll_page()'."
+            )
 
         clean = text.strip()
 
@@ -193,7 +205,13 @@ class BrowserDOMDriver:
     def type_into_input(self, selector_or_label: str, text: str, press_enter: bool = False) -> Dict[str, Any]:
         """Finds input field by placeholder, label, or selector and types text."""
         if not self._page or self._page.is_closed():
-            raise RuntimeError("No active browser page open. Call navigate(url) first.")
+            raise RuntimeError(
+                "No automated Playwright browser session is active. "
+                "CRITICAL: If you want to interact with an ALREADY OPEN window or application on the user's desktop "
+                "(e.g., an open browser, code editor, or LeetCode tab), do NOT call type_webpage_input! "
+                "Instead, use Desktop GUI tools: 'focus_window(query)', 'inspect_screen()', "
+                "'click_element(element_description)', 'type_text_input(text)', 'press_shortcut(hotkey)', or 'scroll_page()'."
+            )
 
         locators = [
             self._page.get_by_placeholder(selector_or_label, exact=False),
@@ -255,12 +273,21 @@ class BrowserDOMDriver:
             else:
                 history.append({"step": i + 1, "error": f"Unknown action '{action}'"})
 
+        current_title = None
+        current_url = None
+        try:
+            if self._page and not self._page.is_closed():
+                current_title = self._page.title()
+                current_url = self._page.url
+        except Exception:
+            pass
+
         return {
             "success": True,
             "steps_executed": len(history),
             "history": history,
-            "current_title": self._page.title() if self._page else None,
-            "current_url": self._page.url if self._page else None,
+            "current_title": current_title,
+            "current_url": current_url,
         }
 
     def close(self):
@@ -282,37 +309,37 @@ class BrowserDOMDriver:
 browser_driver = BrowserDOMDriver()
 
 
-@registry.register(description="Switches to a designated or new desktop workspace, launches Google Chrome, and navigates directly to the target URL.")
+@registry.register(description="[AUTOMATED PLAYWRIGHT BROWSER ONLY - DO NOT USE FOR EXISTING DESKTOP WINDOWS] Switches to a designated or new desktop workspace, launches Google Chrome, and navigates directly to the target URL.")
 def open_browser_in_workspace(url: str, workspace_id: Optional[int] = None) -> Dict[str, Any]:
     return browser_driver.open_in_workspace(url, workspace_id=workspace_id)
 
 
-@registry.register(description="Navigates to a website and returns page title and load status using the high-speed DOM driver.")
+@registry.register(description="[AUTOMATED PLAYWRIGHT BROWSER ONLY - DO NOT USE FOR EXISTING DESKTOP WINDOWS] Navigates to a website in a new Playwright automation session. (If you want to use an already-open desktop browser, use focus_window and desktop tools instead).")
 def browser_navigate(url: str) -> Dict[str, Any]:
     return browser_driver.navigate(url)
 
 
-@registry.register(description="Scans the current web page DOM in milliseconds and returns an instant summary of all clickable buttons, links, and text inputs without consuming vision tokens.")
+@registry.register(description="[AUTOMATED PLAYWRIGHT BROWSER ONLY - DO NOT USE FOR EXISTING DESKTOP WINDOWS] Scans the Playwright-managed browser page DOM and returns an instant summary of interactive elements.")
 def scan_webpage_dom(max_elements: int = 35) -> Dict[str, Any]:
     return browser_driver.scan_summary(max_items=max_elements)
 
 
-@registry.register(description="Extracts all visible clickable buttons, links, and inputs on the current web page directly from the DOM in milliseconds.")
+@registry.register(description="[AUTOMATED PLAYWRIGHT BROWSER ONLY - DO NOT USE FOR EXISTING DESKTOP WINDOWS] Extracts all visible clickable buttons, links, and inputs on the Playwright automation page.")
 def get_webpage_interactive_elements() -> List[Dict[str, Any]]:
     return browser_driver.get_interactive_elements()
 
 
-@registry.register(description="Clicks a button or link on the active web page by matching its text, label, or selector directly in the DOM (sub-15ms, 0 vision tokens).")
+@registry.register(description="[AUTOMATED PLAYWRIGHT BROWSER ONLY - DO NOT USE FOR EXISTING DESKTOP WINDOWS] Clicks a button or link inside a Playwright automation page. (For existing desktop windows and open browsers, use click_element instead).")
 def click_webpage_element(element_text: str) -> Dict[str, Any]:
     return browser_driver.click_element_by_text(element_text)
 
 
-@registry.register(description="Types text into a form or search input field on the current web page using semantic DOM locators.")
+@registry.register(description="[AUTOMATED PLAYWRIGHT BROWSER ONLY - DO NOT USE FOR EXISTING DESKTOP WINDOWS] Types text into a form or search input field inside a Playwright automation session. (For desktop windows, use type_text_input instead).")
 def type_webpage_input(field_name_or_placeholder: str, text_to_type: str, press_enter: bool = False) -> Dict[str, Any]:
     return browser_driver.type_into_input(field_name_or_placeholder, text_to_type, press_enter=press_enter)
 
 
-@registry.register(description="Executes a compound chain of web actions (e.g. open, scan, click, type) in a single fast call without multiple reasoning turns.")
+@registry.register(description="[AUTOMATED PLAYWRIGHT BROWSER ONLY - DO NOT USE FOR EXISTING DESKTOP WINDOWS] Executes a compound chain of web actions in a Playwright automation session.")
 def execute_browser_chain(steps: List[Dict[str, Any]]) -> Dict[str, Any]:
     return browser_driver.execute_chain(steps)
 
