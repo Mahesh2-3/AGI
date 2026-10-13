@@ -22,8 +22,10 @@ class FastPathRouter:
         text = user_input.strip()
         lower = text.lower()
 
-        # Clean leading wake word if present
-        lower = re.sub(r"^(?:hey |ok |okay )?jarvis[,:\s]*", "", lower).strip()
+        # Clean leading wake word or prompt prefix if present (e.g. "Sir >", "Sir,", "Jarvis:")
+        lower = re.sub(r"^(?:(?:hey |ok |okay )?jarvis|sir)[,:\s>]+", "", lower).strip()
+        # Clean trailing wake word or polite suffixes (e.g. "... jarvis", "... sir", "... please")
+        lower = re.sub(r"[,:\s]+(?:jarvis|sir|please)\??$", "", lower).strip()
 
         # 1. Current Time
         if re.search(r"^(?:what(?:'s| is) the time|current time|what time is it|tell me the time)\??$", lower):
@@ -91,6 +93,21 @@ class FastPathRouter:
                 latency = res.output.get("capture_latency_ms", "N/A") if isinstance(res.output, dict) else "N/A"
                 path = res.output.get("path", "") if isinstance(res.output, dict) else ""
                 return f"Desktop visual captured in {latency}ms, Sir. Saved to `{path}`."
+
+        # 5b. Direct Screen Reading & Perception Reflex
+        if (
+            re.search(r"^(?:(?:can|could) you )?(?:read|inspect|describe|look at|check|see) (?:the |my )?screen\??$", lower)
+            or re.search(r"^(?:what(?:'s| is) on (?:the |my )?screen|what (?:do|can) you see(?: on (?:the |my )?screen)?)\??$", lower)
+        ):
+            res = self.registry.execute("inspect_screen", {"user_prompt": text})
+            if res.success and isinstance(res.output, dict):
+                desc = res.output.get("description", "")
+                if any(k in desc.lower() for k in ["failed across active models", "inspection unavailable"]):
+                    return f"I was unable to inspect the screen, Sir: {desc}"
+                if desc:
+                    return f"Here is what is currently visible on your screen, Sir:\n\n{desc}"
+                return "The screen appears to be blank or unavailable, Sir."
+            return f"I was unable to inspect the screen, Sir: {res.error if res else 'Unknown error'}"
 
         # 6. Launch Application
         m_app = re.search(r"^(?:open|launch|start) (?:the )?([a-zA-Z0-9_\-\.]+?)(?: application| app)?(?: please)?\??$", lower)

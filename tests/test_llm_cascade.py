@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock
+from config.settings import settings
 from core.llm_client import LLMClient
 
 
@@ -103,7 +104,7 @@ def test_llm_client_multi_key_rotation():
 def test_llm_client_default_ollama():
     client = LLMClient()
     assert client.provider == "ollama"
-    assert client.model == "qwen3:8b"
+    assert client.model == settings.DEFAULT_MODEL
     assert client.is_configured is True
 
 

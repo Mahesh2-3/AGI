@@ -73,9 +73,35 @@ def test_fast_path_workspace_routing():
     assert "Switched display to workspace 1" in res
 
 
+def test_fast_path_read_screen_routing():
+    registry = ToolRegistry()
+
+    @registry.register(description="Inspect screen")
+    def inspect_screen(user_prompt: str = "") -> dict:
+        return {"description": "Active window: VS Code"}
+
+    router = FastPathRouter(registry=registry)
+    res = router.route("Sir > read the screen")
+    assert res is not None
+    assert "Active window: VS Code" in res
+
+    res2 = router.route("read the screen")
+    assert res2 is not None
+    assert "Active window: VS Code" in res2
+
+    res3 = router.route("what do you see on the screen?")
+    assert res3 is not None
+    assert "Active window: VS Code" in res3
+
+    res4 = router.route("read the screen jarvis")
+    assert res4 is not None
+    assert "Active window: VS Code" in res4
+
+
 if __name__ == "__main__":
     test_fast_path_time_routing()
     test_fast_path_complex_query_falls_back()
     test_fast_path_in_agent_bypasses_llm()
     test_fast_path_workspace_routing()
+    test_fast_path_read_screen_routing()
     print("✅ All fast path router tests passed successfully!")

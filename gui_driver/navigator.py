@@ -17,23 +17,6 @@ class ClosedLoopNavigator:
         verify: bool = True,
     ) -> Dict[str, Any]:
         """Locates an element on screen, executes mouse click, and verifies visual update."""
-        # 0. Fast-path: If browser DOM driver has an active page and matches
-        try:
-            from tools.browser_dom import browser_driver
-            if browser_driver._page and not browser_driver._page.is_closed():
-                dom_res = browser_driver.click_element_by_text(element_description)
-                if dom_res.get("success"):
-                    return {
-                        "success": True,
-                        "element": element_description,
-                        "method": "browser_dom",
-                        "verified": True,
-                        "visual_change_detected": True,
-                        "details": dom_res,
-                    }
-        except Exception:
-            pass
-
         # 1. Observe: Capture baseline frame
         baseline = capture_engine.capture_full_screen()
 

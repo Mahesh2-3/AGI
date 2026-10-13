@@ -2,6 +2,7 @@ import logging
 import os
 from typing import Any, Callable, Dict, Generator, List, Optional
 from config.settings import settings
+from core.model_manager import model_manager
 
 logger = logging.getLogger("JARVIS.LLM")
 
@@ -14,7 +15,7 @@ GROQ_CASCADE_MODELS = [
 
 
 class LLMClient:
-    """Manages connections to model providers (default: local Ollama qwen3:8b running on GPU)."""
+    """Manages connections to model providers (default: local Ollama qwen3:4b running on GPU)."""
 
     def __init__(
         self,
@@ -23,7 +24,7 @@ class LLMClient:
         on_fallback: Optional[Callable[[str, str, str], None]] = None,
     ):
         self.provider = (provider or getattr(settings, "DEFAULT_PROVIDER", "ollama")).lower()
-        self.model = model or getattr(settings, "DEFAULT_MODEL", "qwen3:8b")
+        self.model = model or getattr(settings, "DEFAULT_MODEL", "qwen3:4b")
         self.ollama_base_url = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
         self.on_fallback = on_fallback
         self._client = None
@@ -174,6 +175,10 @@ class LLMClient:
                     kwargs["tools"] = tools
                     kwargs["tool_choice"] = "auto"
 
+                if self.provider == "ollama":
+                    model_manager.prepare_for_model(candidate_model)
+                    kwargs["extra_body"] = {"keep_alive": "2m"}
+
                 try:
                     response = client.chat.completions.create(**kwargs)
                     return response
@@ -270,6 +275,10 @@ class LLMClient:
                 if tools and len(tools) > 0:
                     kwargs["tools"] = tools
                     kwargs["tool_choice"] = "auto"
+
+                if self.provider == "ollama":
+                    model_manager.prepare_for_model(candidate_model)
+                    kwargs["extra_body"] = {"keep_alive": "2m"}
 
                 try:
                     stream = client.chat.completions.create(**kwargs)

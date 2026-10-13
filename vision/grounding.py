@@ -140,7 +140,7 @@ class VisualGroundingEngine:
     def get_current_user_prompt(self) -> Optional[str]:
         return self._current_user_prompt
 
-    def _prepare_image(self, image_path: Path, max_dimension: int = 1920) -> Tuple[bytes, int, int]:
+    def _prepare_image(self, image_path: Path, max_dimension: int = 1280) -> Tuple[bytes, int, int]:
         """Loads, optionally resizes, and returns JPEG bytes and actual dimensions."""
         with Image.open(image_path) as img:
             w, h = img.size
@@ -427,6 +427,11 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
         """Dispatches an inference request to the appropriate VLM provider."""
         if model_info.provider == "ollama":
             import urllib.request
+            from core.model_manager import model_manager
+
+            # Ensure any loaded reasoning model is unloaded so VLM has dedicated VRAM
+            model_manager.prepare_for_model(model_info.model_name)
+
             b64_img = base64.b64encode(img_bytes).decode("utf-8")
             url = f"{self.ollama_base_url.rstrip('/')}/api/chat"
             payload: Dict[str, Any] = {
@@ -439,6 +444,7 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
                     }
                 ],
                 "stream": False,
+                "keep_alive": 0,  # Unload immediately after inference to prevent GPU memory/temperature spikes
                 "options": {
                     "temperature": 0.0 if json_format else 0.2,
                     "num_predict": max_tokens,
@@ -454,9 +460,20 @@ Do NOT output any markdown backticks or extra text outside the JSON object."""
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                resp_data = json.loads(resp.read().decode("utf-8"))
-                return resp_data.get("message", {}).get("content", "")
+            try:
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    return resp_data.get("message", {}).get("content", "")
+            except urllib.error.HTTPError as e:
+                err_detail = ""
+                try:
+                    err_detail = e.read().decode("utf-8")
+                except Exception:
+                    pass
+                raise RuntimeError(f"Ollama vision request failed [HTTP {e.code}]: {err_detail or e.reason}") from e
+            finally:
+                # Guarantee vision model is purged from GPU VRAM
+                model_manager.unload_model(model_info.model_name)
 
         elif model_info.provider == "groq":
             from groq import Groq
