@@ -489,6 +489,7 @@ class JarvisAgent:
                 else:
                     self.messages.append(message.model_dump(exclude_none=True))
 
+                abort_subsequent = False
                 for tool_call in tool_calls:
                     fn_name = tool_call.function.name
                     raw_args = tool_call.function.arguments

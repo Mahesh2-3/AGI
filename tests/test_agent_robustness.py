@@ -187,3 +187,72 @@ def test_locate_by_template_allows_small_template():
         assert res["found"] is True
         assert res["x"] == 116  # 100 + 16
         assert res["y"] == 116  # 100 + 16
+
+
+def test_batch_tool_calls_no_unbound_error():
+    registry = ToolRegistry()
+    executed_order = []
+
+    @registry.register(description="First tool")
+    def tool_one(val: str) -> dict:
+        executed_order.append(f"one_{val}")
+        return {"status": "ok"}
+
+    @registry.register(description="Second tool")
+    def tool_two(val: str) -> dict:
+        executed_order.append(f"two_{val}")
+        return {"status": "ok"}
+
+    tc1 = FakeToolCall("call_1", "tool_one", json.dumps({"val": "A"}))
+    tc2 = FakeToolCall("call_2", "tool_two", json.dumps({"val": "B"}))
+
+    resp1 = FakeChatResponse(FakeChatCompletionMessage(tool_calls=[tc1, tc2]))
+    resp2 = FakeChatResponse(FakeChatCompletionMessage(content="Both finished."))
+
+    mock_llm = MagicMock(spec=LLMClient)
+    mock_llm.is_configured = False
+    mock_llm.chat.side_effect = [resp1, resp2]
+
+    agent = JarvisAgent(llm_client=mock_llm, tool_registry=registry, enable_fast_path=False)
+    # This must run without UnboundLocalError: cannot access local variable 'abort_subsequent'
+    reply = agent.step("run both tools")
+
+    assert executed_order == ["one_A", "two_B"]
+    assert "Both finished" in reply
+
+
+def test_abort_subsequent_on_first_tool_failure():
+    registry = ToolRegistry()
+    executed = []
+
+    @registry.register(description="Failing tool")
+    def failing_tool() -> dict:
+        executed.append("fail")
+        raise RuntimeError("Element not found on screen")
+
+    @registry.register(description="Second tool")
+    def second_tool() -> dict:
+        executed.append("second")
+        return {"done": True}
+
+    tc1 = FakeToolCall("call_1", "failing_tool", "{}")
+    tc2 = FakeToolCall("call_2", "second_tool", "{}")
+
+    resp1 = FakeChatResponse(FakeChatCompletionMessage(tool_calls=[tc1, tc2]))
+    resp2 = FakeChatResponse(FakeChatCompletionMessage(content="Handled failure."))
+
+    mock_llm = MagicMock(spec=LLMClient)
+    mock_llm.is_configured = False
+    mock_llm.chat.side_effect = [resp1, resp2]
+
+    agent = JarvisAgent(llm_client=mock_llm, tool_registry=registry, enable_fast_path=False)
+    reply = agent.step("attempt action")
+
+    # Only first tool attempted; second was aborted cleanly
+    assert executed == ["fail"]
+    # Check that dummy aborted tool result was added for call_2
+    tool_msgs = [m for m in agent.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2
+    assert tool_msgs[1]["tool_call_id"] == "call_2"
+    assert "Tool execution aborted" in tool_msgs[1]["content"]
+
