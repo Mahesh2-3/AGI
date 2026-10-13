@@ -170,6 +170,27 @@ class VisualGroundingEngine:
                 "error": f"Template image not found: {template_path}",
             }
 
+        try:
+            with Image.open(template_p) as t_img:
+                tw, th = t_img.size
+        except Exception as e:
+            return {
+                "found": False,
+                "error": f"Failed to open template image '{template_path}': {e}",
+            }
+
+        # Guard: Reject full-screen desktop screenshots passed as template images
+        if tw >= 800 and th >= 600:
+            return {
+                "found": False,
+                "error": (
+                    f"Invalid template image: '{template_p.name}' is {tw}x{th} (full-screen screenshot). "
+                    "locate_element_by_image is strictly for small cropped icon or button templates. "
+                    "To find or click UI elements visible on the screen, use click_element(element_description) "
+                    "or locate_element(element_description)."
+                ),
+            }
+
         if not screenshot_path:
             shot = capture_engine.capture_full_screen()
             screenshot_p = Path(shot["path"])
@@ -179,10 +200,10 @@ class VisualGroundingEngine:
         with Image.open(screenshot_p) as screen_img:
             orig_w, orig_h = screen_img.size
 
-        # 1. Try PyAutoGUI / pyscreeze template matching
+        # 1. Try pyscreeze template matching directly (pure Pillow, no Tkinter dependency)
         try:
-            import pyautogui
-            box = pyautogui.locate(str(template_p), str(screenshot_p), confidence=confidence)
+            import pyscreeze
+            box = pyscreeze.locate(str(template_p), str(screenshot_p))
             if box is not None:
                 x1, y1 = box.left, box.top
                 x2, y2 = box.left + box.width, box.top + box.height
@@ -203,8 +224,8 @@ class VisualGroundingEngine:
                     "screen_width": orig_w,
                     "screen_height": orig_h,
                 }
-        except Exception as e:
-            logger.debug(f"PyAutoGUI template matching skipped: {e}")
+        except (Exception, SystemExit) as e:
+            logger.debug(f"Pyscreeze template matching skipped: {e}")
 
         # 2. Try OpenCV template matching if available
         try:
@@ -715,9 +736,26 @@ def locate_element(element_description: str) -> Dict[str, Any]:
     return grounding_engine.locate_element(query=element_description)
 
 
-@registry.register(description="Locates a known button or UI icon on screen using template matching from an image file.")
-def locate_element_by_image(image_path: str, confidence: float = 0.8) -> Dict[str, Any]:
-    return grounding_engine.locate_by_template(template_path=image_path, confidence=confidence)
+@registry.register(
+    description=(
+        "[ICON CROP TEMPLATE MATCHING ONLY] Locates a small cropped icon or button template image on screen using OpenCV pixel matching. "
+        "DO NOT pass full-screen desktop screenshots here. For finding or clicking UI elements, buttons, or links visible on the screen, "
+        "always use click_element(element_description) or locate_element(element_description)."
+    )
+)
+def locate_element_by_image(
+    image_path: Optional[str] = None,
+    template_path: Optional[str] = None,
+    confidence: float = 0.8,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    target_path = image_path or template_path or kwargs.get("path")
+    if not target_path:
+        return {
+            "found": False,
+            "error": "Missing required image_path parameter for template matching.",
+        }
+    return grounding_engine.locate_by_template(template_path=target_path, confidence=confidence)
 
 
 @registry.register(

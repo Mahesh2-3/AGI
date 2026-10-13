@@ -1,5 +1,8 @@
 import json
+import re
 import time
+import uuid
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 from core.fast_path import FastPathRouter
 from core.llm_client import LLMClient
@@ -96,6 +99,9 @@ class JarvisAgent:
         initial_user = self.messages[1] if len(self.messages) > 1 and self.messages[1].get("role") == "user" else None
 
         tail = self.messages[-max_recent:]
+        while tail and tail[0].get("role") == "tool":
+            tail = tail[1:]
+
         pruned = [system_msg]
         if initial_user and initial_user not in tail:
             pruned.append(initial_user)
@@ -103,6 +109,105 @@ class JarvisAgent:
             if m != system_msg and m != initial_user:
                 pruned.append(m)
         return pruned
+
+    def _extract_synthetic_tool_calls(self, content: str) -> List[Any]:
+        """Extracts tool calls emitted as raw JSON or code blocks within message content."""
+        if not content or not isinstance(content, str):
+            return []
+
+        candidates = []
+
+        # 1. Extract markdown code blocks (e.g. ```json ... ``` or ```tool_call ... ```)
+        code_block_pattern = re.compile(r"```(?:json|tool_call)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+        for match in code_block_pattern.finditer(content):
+            candidates.append(match.group(1).strip())
+
+        # 2. Extract <tool_call> tags
+        tag_pattern = re.compile(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.IGNORECASE)
+        for match in tag_pattern.finditer(content):
+            candidates.append(match.group(1).strip())
+
+        # 3. Add entire content
+        candidates.append(content.strip())
+
+        def _extract_balanced_json(text: str) -> List[Dict[str, Any]]:
+            results = []
+            depth = 0
+            start = -1
+            in_str = False
+            escape = False
+            for idx, ch in enumerate(text):
+                if ch == '"' and not escape:
+                    in_str = not in_str
+                elif ch == '\\' and in_str:
+                    escape = not escape
+                    continue
+                elif not in_str:
+                    if ch == '{':
+                        if depth == 0:
+                            start = idx
+                        depth += 1
+                    elif ch == '}':
+                        if depth > 0:
+                            depth -= 1
+                            if depth == 0 and start != -1:
+                                snippet = text[start : idx + 1]
+                                try:
+                                    parsed = json.loads(snippet)
+                                    if isinstance(parsed, dict):
+                                        results.append(parsed)
+                                except Exception:
+                                    pass
+                                start = -1
+                escape = False
+            return results
+
+        all_dicts = []
+        for text in candidates:
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    all_dicts.append(parsed)
+                elif isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, dict):
+                            all_dicts.append(item)
+            except Exception:
+                all_dicts.extend(_extract_balanced_json(text))
+
+        valid_calls = []
+        for item in all_dicts:
+            fn_name = item.get("name") or item.get("function") or item.get("tool")
+            if not fn_name or not isinstance(fn_name, str):
+                continue
+
+            tool_obj = self.registry.get_tool(fn_name)
+            if not tool_obj:
+                continue
+
+            args = item.get("arguments", item.get("parameters", {}))
+            if not args and any(k not in ("name", "function", "tool", "type") for k in item.keys()):
+                args = {k: v for k, v in item.items() if k not in ("name", "function", "tool", "type")}
+
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    pass
+
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            valid_calls.append(
+                SimpleNamespace(
+                    id=call_id,
+                    type="function",
+                    function=SimpleNamespace(
+                        name=fn_name,
+                        arguments=json.dumps(args) if isinstance(args, dict) else str(args),
+                    ),
+                )
+            )
+
+        return valid_calls
 
     def _generate_workflow_via_llm(self, user_input: str) -> Optional[str]:
         """Queries LLM for a fast one-line conditional arrow-chain workflow."""
@@ -354,12 +459,37 @@ class JarvisAgent:
             if reasoning and self.on_thought:
                 self.on_thought(str(reasoning).strip())
 
-            # Check if the LLM invoked tools
-            if hasattr(message, "tool_calls") and message.tool_calls:
-                # Add the assistant's tool-call request to the message history
-                self.messages.append(message.model_dump(exclude_none=True))
+            # Check if the LLM invoked tools (via standard tool_calls or synthetic tool calls in content)
+            tool_calls = list(message.tool_calls) if getattr(message, "tool_calls", None) else []
+            is_synthetic = False
+            if not tool_calls and getattr(message, "content", None):
+                extracted = self._extract_synthetic_tool_calls(message.content)
+                if extracted:
+                    tool_calls = extracted
+                    is_synthetic = True
 
-                for tool_call in message.tool_calls:
+            if tool_calls:
+                # Add the assistant's tool-call request to the message history
+                if is_synthetic:
+                    self.messages.append({
+                        "role": "assistant",
+                        "content": message.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments if isinstance(tc.function.arguments, str) else json.dumps(tc.function.arguments),
+                                },
+                            }
+                            for tc in tool_calls
+                        ],
+                    })
+                else:
+                    self.messages.append(message.model_dump(exclude_none=True))
+
+                for tool_call in tool_calls:
                     fn_name = tool_call.function.name
                     raw_args = tool_call.function.arguments
 
@@ -367,6 +497,17 @@ class JarvisAgent:
                         args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                     except json.JSONDecodeError:
                         args = {"raw_arguments": raw_args}
+
+                    # Flatten nested arguments/parameters dictionaries from Qwen/Ollama models
+                    if isinstance(args, dict):
+                        if "arguments" in args and isinstance(args["arguments"], dict):
+                            nested = args["arguments"]
+                            extra = {k: v for k, v in args.items() if k not in ("arguments", "function", "name")}
+                            args = {**nested, **extra}
+                        elif "parameters" in args and isinstance(args["parameters"], dict):
+                            nested = args["parameters"]
+                            extra = {k: v for k, v in args.items() if k not in ("parameters", "function", "name")}
+                            args = {**nested, **extra}
 
                     if self.on_tool_call:
                         self.on_tool_call(fn_name, args)
