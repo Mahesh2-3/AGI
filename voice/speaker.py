@@ -9,10 +9,13 @@ import threading
 import time
 from pathlib import Path
 from typing import Generator, Iterable, List, Optional
+import logging
 import edge_tts
 
 from config.settings import settings
 from tools.base import registry
+
+logger = logging.getLogger("JARVIS.Voice.Speaker")
 
 DEFAULT_VOICE = "en-GB-RyanNeural"  # Crisp British gentleman voice
 RAM_AUDIO_DIR = Path("/dev/shm/jarvis_audio") if Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK) else None
@@ -98,6 +101,21 @@ class JarvisSpeaker:
             # Multiple sentences: pipeline synthesis & playback concurrently
             return self._speak_pipelined_sentences(sentences, wait=wait)
 
+    def _try_offline_fallback(self, sentence: str) -> bool:
+        """Attempts offline fallback TTS if local system binaries exist."""
+        for cmd_name, cmd_args in [
+            ("spd-say", ["spd-say", "-t", "male2", sentence]),
+            ("espeak-ng", ["espeak-ng", "-v", "en-gb", sentence]),
+            ("espeak", ["espeak", "-v", "en-gb", sentence]),
+        ]:
+            if shutil.which(cmd_name):
+                try:
+                    subprocess.run(cmd_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                    return True
+                except Exception:
+                    pass
+        return False
+
     def _speak_single_sentence(self, sentence: str, wait: bool = True) -> str:
         tmp_path = str(self.audio_dir / f"jarvis_voice_{time.perf_counter_ns()}.mp3")
         try:
@@ -118,8 +136,14 @@ class JarvisSpeaker:
             return f"Spoke: '{sentence[:60]}...'"
         except Exception as e:
             if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise RuntimeError(f"Speech synthesis error: {e}")
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            logger.warning(f"Edge-TTS synthesis error: {e}")
+            if self._try_offline_fallback(sentence):
+                return f"Spoke (offline fallback): '{sentence[:60]}...'"
+            return f"[Speech synthesis unavailable: {e}]"
 
     def _speak_pipelined_sentences(self, sentences: List[str], wait: bool = True) -> str:
         """Concurrently synthesizes sentence N+1 while sentence N is playing."""

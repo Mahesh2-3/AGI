@@ -1,10 +1,12 @@
 # Project J.A.R.V.I.S.
 > **Just A Rather Very Intelligent System**  
 > An autonomous desktop AI agent designed to interact with your operating system like a human: observing screens, controlling cursor and keyboard, managing applications, executing commands, and communicating with natural voice.
-e
+
 ---
 
 ## 🧭 Project Vision & Architecture
+
+> 📖 **Full System Architecture Document**: See [ARCHITECTURE.md](file:///home/mahesh/core/AGI/ARCHITECTURE.md) for detailed flowcharts covering sensory ingestion, ReAct decision loops, closed-loop GUI automation, and safety gates.
 
 The objective of this project is to build an autonomous desktop companion inspired by Iron Man's J.A.R.V.I.S. Rather than just a chatbot, this system integrates:
 
@@ -53,7 +55,7 @@ This project is broken down into structured, testable milestones so each capabil
 
 ### Phase 2: System & Workspace Control (The "Hands - Level 1")
 - [x] **Step 2.1 — Application Management**
-  - Launch, focus, and terminate applications cleanly on Linux (`xdg-open`, `gio`, `wmctrl`, `xdotool`, and native Hyprland `hyprctl`).
+  - Launch, focus, and terminate applications cleanly on Linux (`xdg-open`, `gio`, and native Hyprland `hyprctl`).
   - Read active windows and running processes (`psutil`).
 - [x] **Step 2.2 — File System & Workspace Automation**
   - Safe file operations: read, search (grep/glob), create, edit, rename, and trash.
