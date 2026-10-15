@@ -829,6 +829,122 @@ class MemoryStore:
                         (now, now, proc_id),
                     )
 
+    def save_checkpoint(
+        self,
+        task_id: str,
+        user_request: str,
+        goal: str,
+        status: str,
+        completed_steps: Optional[List[str]] = None,
+        pending_steps: Optional[List[str]] = None,
+        last_tool_name: Optional[str] = None,
+        last_tool_result: Optional[str] = None,
+        error_summary: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Saves or updates a resumable working memory task checkpoint."""
+        with self._lock:
+            now = datetime.now(timezone.utc).isoformat()
+            comp_json = json.dumps(completed_steps or [])
+            pend_json = json.dumps(pending_steps or [])
+
+            with self.db_manager.connection() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO task_checkpoints (
+                        task_id, project_id, user_request, goal, status,
+                        completed_steps, pending_steps, last_tool_name,
+                        last_tool_result, error_summary, created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        coalesce((SELECT created_at FROM task_checkpoints WHERE task_id = ?), ?),
+                        ?
+                    );
+                    """,
+                    (
+                        task_id,
+                        project_id,
+                        user_request,
+                        goal,
+                        status,
+                        comp_json,
+                        pend_json,
+                        last_tool_name,
+                        last_tool_result,
+                        error_summary,
+                        task_id,
+                        now,
+                        now,
+                    ),
+                )
+
+            return {
+                "task_id": task_id,
+                "project_id": project_id,
+                "user_request": user_request,
+                "goal": goal,
+                "status": status,
+                "completed_steps": completed_steps or [],
+                "pending_steps": pending_steps or [],
+                "last_tool_name": last_tool_name,
+                "last_tool_result": last_tool_result,
+                "error_summary": error_summary,
+            }
+
+    def get_checkpoint(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a task checkpoint by ID."""
+        with self._lock:
+            with self.db_manager.connection() as conn:
+                row = conn.execute(
+                    "SELECT * FROM task_checkpoints WHERE task_id = ?;",
+                    (task_id,),
+                ).fetchone()
+                if not row:
+                    return None
+                data = dict(row)
+                data["completed_steps"] = json.loads(data["completed_steps"])
+                data["pending_steps"] = json.loads(data["pending_steps"])
+                return data
+
+    def get_latest_active_checkpoint(self, project_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieves the most recent unfinished or resumable task checkpoint."""
+        with self._lock:
+            sql = "SELECT * FROM task_checkpoints WHERE status IN ('in_progress', 'interrupted', 'failed')"
+            params: List[Any] = []
+            if project_id:
+                sql += " AND project_id = ?"
+                params.append(project_id)
+            sql += " ORDER BY updated_at DESC LIMIT 1;"
+
+            with self.db_manager.connection() as conn:
+                row = conn.execute(sql, params).fetchone()
+                if not row:
+                    return None
+                data = dict(row)
+                data["completed_steps"] = json.loads(data["completed_steps"])
+                data["pending_steps"] = json.loads(data["pending_steps"])
+                return data
+
+    def update_checkpoint_status(self, task_id: str, status: str, error_summary: Optional[str] = None):
+        """Updates the status and optional error summary of an existing checkpoint."""
+        with self._lock:
+            now = datetime.now(timezone.utc).isoformat()
+            with self.db_manager.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE task_checkpoints
+                    SET status = ?, error_summary = coalesce(?, error_summary), updated_at = ?
+                    WHERE task_id = ?;
+                    """,
+                    (status, error_summary, now, task_id),
+                )
+
+    def clear_checkpoint(self, task_id: str):
+        """Removes a task checkpoint."""
+        with self._lock:
+            with self.db_manager.connection() as conn:
+                conn.execute("DELETE FROM task_checkpoints WHERE task_id = ?;", (task_id,))
+
     def get_context_summary(
         self,
         max_items: int = 5,

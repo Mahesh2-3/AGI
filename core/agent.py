@@ -11,6 +11,7 @@ from core.model_manager import model_manager
 from core.prompts import get_system_prompt
 from core.safety import SafetyEngine
 from core.workspace import workspace_manager
+from memory.context_builder import ContextBuilder
 from memory.store import MemoryStore, memory_store as default_memory_store
 from tools.base import ToolRegistry, ToolResult, registry as default_registry
 from vision.grounding import grounding_engine
@@ -59,6 +60,8 @@ class JarvisAgent:
         self.registry = tool_registry or default_registry
         self.safety = safety_engine or SafetyEngine()
         self.memory = memory_store or default_memory_store
+        self.context_builder = ContextBuilder(store=self.memory)
+        self.current_task_id: Optional[str] = None
         self.max_iterations = max_iterations
         self.enable_fast_path = enable_fast_path
         self.enable_streaming = enable_streaming
@@ -121,15 +124,10 @@ class JarvisAgent:
         """Constructs system prompt augmented with proactive long-term memory & relevant recalled facts.
         Caches prompt if context has not changed (A5).
         """
-        core_mem = self.memory.get_context_summary()
-        recalled_section = ""
-        if user_query:
-            relevant = self.memory.recall(user_query, limit=3)
-            if relevant:
-                recalled_lines = [f"  - [{m.category.capitalize()}] {m.content}" for m in relevant]
-                recalled_section = "• Relevant Recalled Memories for this instruction:\n" + "\n".join(recalled_lines)
-
-        full_mem_context = f"{core_mem}\n{recalled_section}".strip()
+        full_mem_context = self.context_builder.build_context(
+            user_query=user_query,
+            include_checkpoint=True,
+        )
         if self._cached_base_prompt and self._cached_memory_context == full_mem_context:
             return self._cached_base_prompt
 
@@ -142,6 +140,7 @@ class JarvisAgent:
         """Clears working memory back to the initial system prompt."""
         self._cached_base_prompt = None
         self._cached_memory_context = None
+        self.current_task_id = None
         self.messages = [
             {"role": "system", "content": self._build_system_prompt()}
         ]
@@ -654,6 +653,9 @@ class JarvisAgent:
 
         # Check for explicit goal cancellation or reset
         if intent_info["type"] == "cancel":
+            if self.current_task_id:
+                self.memory.update_checkpoint_status(self.current_task_id, status="cancelled")
+                self.current_task_id = None
             self.active_goal = None
             self.last_completed_goal = None
             self.failed_operations.clear()
@@ -670,8 +672,15 @@ class JarvisAgent:
             # Observational queries are self-contained and clear lingering active action goals
             self.active_goal = None
         elif intent_info["is_new_action"]:
-            # Fresh action task: start a new goal
+            # Fresh action task: start a new goal and initialize working memory checkpoint
             self.active_goal = user_input.strip()
+            self.current_task_id = f"task_{uuid.uuid4().hex[:8]}"
+            self.memory.save_checkpoint(
+                task_id=self.current_task_id,
+                user_request=user_input,
+                goal=self.active_goal,
+                status="in_progress",
+            )
 
         # Build prompt payload preserving active goal context and resolved action
         target_active_goal = self.active_goal or getattr(self, "last_completed_goal", None)
@@ -922,6 +931,19 @@ class JarvisAgent:
                         })
                         abort_subsequent = True
 
+                    if self.current_task_id:
+                        comp_tools = [t.get("tool") for t in self.last_turn_metrics["tool_executions"] if t.get("success")]
+                        self.memory.save_checkpoint(
+                            task_id=self.current_task_id,
+                            user_request=user_input,
+                            goal=self.active_goal or user_input,
+                            status="in_progress" if result.success else "failed",
+                            completed_steps=comp_tools,
+                            last_tool_name=fn_name,
+                            last_tool_result=str(result.output)[:120] if result.success else str(result.error)[:120],
+                            error_summary=str(result.error) if not result.success else None,
+                        )
+
                     if self.on_tool_result:
                         try:
                             self.on_tool_result(fn_name, result.output if result.success else result.error, result.success, duration)
@@ -1009,6 +1031,9 @@ class JarvisAgent:
                 self.active_goal = None
             elif self.active_goal:
                 self.last_completed_goal = self.active_goal
+                if self.current_task_id:
+                    self.memory.update_checkpoint_status(self.current_task_id, status="completed")
+                    self.current_task_id = None
 
             try:
                 model_manager.unload_on_idle(force=False)
@@ -1024,6 +1049,10 @@ class JarvisAgent:
         self.last_turn_metrics["total_duration_s"] = round(time.perf_counter() - start_time, 4)
 
         if self.failed_operations:
+            if self.current_task_id:
+                last_err = self.failed_operations[-1].get("error", "Task execution failed")
+                self.memory.update_checkpoint_status(self.current_task_id, status="failed", error_summary=str(last_err))
+
             failure_lines = "\n".join([f"- **{f['tool']}**: {f['error']}" for f in self.failed_operations[-3:]])
             fail_msg = (
                 f"Sir, I was unable to complete the task because the following operations encountered issues:\n"
