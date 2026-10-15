@@ -196,9 +196,9 @@ class JarvisSpeaker:
         if wait:
             synth_thread.join()
             play_thread.join()
-            return f"Spoke {len(sentences)} sentences pipelined."
+            return f"Spoke {len(sentences)} sentences."
         else:
-            return f"Pipelined speech started ({len(sentences)} sentences)."
+            return f"Speech started ({len(sentences)} sentences)."
 
     def speak_stream(self, token_stream: Iterable[str], wait: bool = True) -> str:
         """Streams incoming LLM tokens, buffering sentences and speaking each as soon as formed."""
@@ -276,6 +276,13 @@ class JarvisSpeaker:
 speaker = JarvisSpeaker()
 
 
-@registry.register(description="Speaks a message out loud to the user in Jarvis's authentic British voice.")
+@registry.register(
+    description=(
+        "Speaks a message out loud to Sir in Jarvis's authentic British voice. "
+        "NOTE: Standard conversation responses are already voiced or displayed automatically. "
+        "Only call this tool when explicitly instructed by Sir to announce, recite, or speak specific words aloud."
+    )
+)
 def speak_message(message: str) -> str:
-    return speaker.speak(message, wait=True)
+    speaker.speak(message, wait=True)
+    return "Message spoken aloud to Sir successfully."

@@ -97,6 +97,22 @@ def test_fast_path_read_screen_routing():
     assert res4 is not None
     assert "Active window: VS Code" in res4
 
+    res5 = router.route("tell me what are you seeing on the screen")
+    assert res5 is not None
+    assert "Active window: VS Code" in res5
+
+    res6 = router.route("Sir > read the screen and tell me what you see")
+    assert res6 is not None
+    assert "Active window: VS Code" in res6
+
+    res7 = router.route("what did i say, i just said what is on the screen")
+    assert res7 is not None
+    assert "Active window: VS Code" in res7
+
+    res8 = router.route("describe what is on my screen")
+    assert res8 is not None
+    assert "Active window: VS Code" in res8
+
 
 if __name__ == "__main__":
     test_fast_path_time_routing()

@@ -95,10 +95,15 @@ class FastPathRouter:
                 return f"Desktop visual captured in {latency}ms, Sir. Saved to `{path}`."
 
         # 5b. Direct Screen Reading & Perception Reflex
-        if (
-            re.search(r"^(?:(?:can|could) you )?(?:read|inspect|describe|look at|check|see) (?:the |my )?screen\??$", lower)
-            or re.search(r"^(?:what(?:'s| is) on (?:the |my )?screen|what (?:do|can) you see(?: on (?:the |my )?screen)?)\??$", lower)
-        ):
+        screen_reading_patterns = [
+            r"^(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?(?:(?:tell|show)\s+me\s+)?(?:read|inspect|describe|look\s+at|check|see)\s+(?:the\s+|my\s+)?screen(?:\s+and\s+(?:tell|show)\s+me\s+what\s+(?:you\s+see|is\s+on\s+it))?\??$",
+            r"^(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?(?:(?:tell|show)\s+me\s+)?what\s+(?:do|can|are)\s+you\s+(?:see|seeing)(?:\s+(?:on|in)\s+(?:the\s+|my\s+)?screen)?\??$",
+            r"^(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?(?:(?:tell|show)\s+me\s+)?what(?:'s|\s+is)\s+(?:currently\s+)?(?:on|visible\s+on)\s+(?:the\s+|my\s+)?screen\??$",
+            r"^(?:(?:can|could|would)\s+you\s+)?(?:tell|show)\s+me\s+what\s+(?:'s|is)\s+on\s+(?:the\s+|my\s+)?screen\??$",
+            r"^(?:what\s+did\s+i\s+say[,\s]+)?(?:i\s+(?:just\s+)?said\s+)?what(?:'s|\s+is)\s+(?:on|visible\s+on)\s+(?:the\s+|my\s+)?screen\??$",
+            r"^(?:describe|summarize)\s+what(?:'s|\s+is|\s+you\s+see)\s+(?:on\s+)?(?:the\s+|my\s+)?screen\??$",
+        ]
+        if any(re.search(pat, lower) for pat in screen_reading_patterns):
             res = self.registry.execute("inspect_screen", {"user_prompt": text})
             if res.success and isinstance(res.output, dict):
                 desc = res.output.get("description", "")
