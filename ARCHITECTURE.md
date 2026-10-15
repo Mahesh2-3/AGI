@@ -1,7 +1,7 @@
 # Project J.A.R.V.I.S. – System Architecture
 
 > **Just A Rather Very Intelligent System**  
-> An autonomous desktop AI agent designed for Linux/Wayland environments to perceive screen state, control input devices, manage applications, run system workflows, and communicate through natural voice.
+> An autonomous, 100% local-first desktop AI agent designed for Linux/Wayland (Hyprland) environments to perceive screen state, control input devices, manage applications, run system workflows, and communicate through natural voice.
 
 ---
 
@@ -14,17 +14,17 @@ flowchart TD
     %% User Inputs & Ingestion
     subgraph Inputs ["1. Input Interfaces & Senses"]
         UserCLI["Terminal CLI (Rich UI / Prompts)"]
-        MicIn["Microphone Audio Stream"]
+        MicIn["Microphone Audio Stream (PipeWire)"]
         WakeWord["Wake-Word Detector ('Jarvis' / 'Hey Jarvis')"]
         VAD["Voice Activity Detection (RMS Energy / Silence Cutoff)"]
-        WhisperSTT["Whisper STT (Groq Turbo / OpenAI)"]
+        LocalSTT["Speech-to-Text Engine"]
         ScreenFeed["Wayland/Hyprland Display (grim / RAM Disk)"]
         SysMetrics["Linux Telemetry (psutil / PipeWire / Network)"]
     end
 
     MicIn --> WakeWord
     WakeWord --> VAD
-    VAD --> WhisperSTT
+    VAD --> LocalSTT
 
     %% Reflex vs Cognitive Routing
     subgraph Routing ["2. Ingestion & Fast-Path Routing"]
@@ -34,49 +34,50 @@ flowchart TD
     end
 
     UserCLI --> InputDispatcher
-    WhisperSTT --> InputDispatcher
+    LocalSTT --> InputDispatcher
     InputDispatcher -- "Deterministic Match" --> FastPath
     FastPath --> ReflexExec
     InputDispatcher -- "Complex / Unknown Goal" --> ReActEngine
 
     %% Cognitive Core
-    subgraph CognitiveCore ["3. Cognitive Core (Brain)"]
+    subgraph CognitiveCore ["3. Cognitive Core (Local Brain)"]
         ReActEngine["Jarvis Agent Orchestrator (ReAct Loop)"]
-        PlanGenerator["Arrow-Chain Workflow Planner"]
-        ContextPruner["Context Pruner (TPM / Token Window Manager)"]
-        PromptBuilder["Prompt Builder (Persona + Recalled Facts)"]
-        LLMClient["LLM Multi-Provider Client"]
-        ModelManager["Ollama VRAM Lifecycle Manager"]
-        MemoryBank[("Persistent Memory Store (Atomic JSON + Profile)")]
+        PlanGenerator["Workflow Planner (Deterministic Templates / LLM Fallback)"]
+        ContextPruner["Context Window Manager (<14 Recent Turns)"]
+        PromptBuilder["Prompt Builder (Persona + Recalled Facts + System State)"]
+        ModelManager["Centralized Ollama Model Manager (VRAM Lifecycle)"]
+        MemoryBank[("Persistent Memory Store (Long-Term Facts + Profile)")]
+        ActiveState["Active Goal & Task State Tracker"]
     end
 
+    ReActEngine <--> ActiveState
     ReActEngine --> PlanGenerator
     ReActEngine <--> MemoryBank
     ReActEngine --> PromptBuilder
     PromptBuilder --> ContextPruner
-    ContextPruner --> LLMClient
-    LLMClient <--> ModelManager
+    ContextPruner --> ModelManager
 
-    %% Model Providers
-    subgraph ModelPool ["4. Neural Inference Engines"]
-        OllamaLocal["Local Ollama GPU (qwen3:4b Reasoning)"]
-        OllamaVLM["Local Ollama GPU (qwen2.5vl:3b Vision)"]
-        GroqCascade["Groq Free-Tier Cascade (gpt-oss-120b / qwen3.8-27b)"]
+    %% Model Inference Engines (100% Local GPU via Ollama)
+    subgraph ModelPool ["4. Local Neural Inference (Ollama GPU)"]
+        OllamaReasoning["Local Reasoning Core: Qwen (e.g. qwen3:8b)"]
+        OllamaVision["Local Vision Core: Qwen-VL (e.g. qwen2.5vl:3b)"]
     end
 
-    LLMClient --> OllamaLocal
-    LLMClient --> GroqCascade
+    ModelManager <--> |Mutual Exclusion / VRAM Swap| OllamaReasoning
+    ModelManager <--> |Mutual Exclusion / VRAM Swap| OllamaVision
 
     %% Safety & Authorization
     subgraph SafetyGate ["5. Safety Engine & Guardrails"]
         RiskClassifier{"Risk Tier Classifier"}
-        TierSafe["SAFE: Telemetry, Read-Only, Captures"]
-        TierModerate["MODERATE: App Launch, Volume, Writes"]
+        TierSafe["SAFE: Telemetry, Read-Only, Verification"]
+        TierModerate["MODERATE: App Launch, Volume, Edits"]
         TierDangerous["DANGEROUS: Shell Execution, Deletion, Kill"]
-        ConfirmPrompt{"User Authorization Gate (Voice / CLI Prompt)"}
+        PromptGuard["Untrusted Screen/Web Prompt Injection Filter"]
+        ConfirmPrompt{"User Authorization Gate (CLI / Voice Prompt)"}
     end
 
-    ReActEngine -- "Tool Call Request" --> RiskClassifier
+    ReActEngine -- "Tool Call Request" --> PromptGuard
+    PromptGuard --> RiskClassifier
     RiskClassifier --> TierSafe
     RiskClassifier --> TierModerate
     RiskClassifier --> TierDangerous
@@ -91,20 +92,21 @@ flowchart TD
         AppTools["App Control (hyprctl, gio, xdg-open)"]
         FileTools["File Operations (Read, Edit Diff, Trash)"]
         ShellTools["Shell Runner (Sandboxed Bash Execution)"]
-        DOMTools["Browser DOM Driver (Playwright Chrome Driver)"]
+        DOMTools["Browser DOM Driver (Playwright Chrome Driver - Primary)"]
         SysTools["System Controls (Volume, Brightness, Notifications)"]
-        NavTools["Closed-Loop Screen Navigator"]
+        NavTools["Closed-Loop Screen Navigator (Visual Fallback)"]
     end
 
     %% Effectors & Desktop Interaction
     subgraph Effectors ["7. Hands & Effectors (Execution)"]
         WorkspaceMgr["Hyprland Workspace Manager"]
-        WaylandPointer["Native Wayland Pointer (C WLR Protocol Bin)"]
+        WaylandPointer["Native Wayland Pointer (wlr-virtual-pointer)"]
         PyAutoGUI["Keyboard & Mouse Automation (XKB Keymap)"]
         TTS["Edge-TTS Synthesis Engine (en-GB-RyanNeural)"]
         AudioOut["Audio Playback (pw-play / ffplay / paplay)"]
     end
 
+    DOMTools -. "DOM-First Browser Actions" .-> Effectors
     NavTools --> WorkspaceMgr
     NavTools --> WaylandPointer
     NavTools --> PyAutoGUI
@@ -114,15 +116,17 @@ flowchart TD
 
     %% Feedback Loop
     subgraph VisionPipeline ["8. Visual Perception & Verification (Eyes)"]
-        GrimCapture["Screen Capture Engine (grim /dev/shm)"]
-        GroundingEngine["Vision Grounding Engine (Coordinate Mapping)"]
-        VisualDiff["Visual Diff Engine (State Change Detection)"]
+        CoordTrans["Standardized CoordinateTransformer (Model <-> Screen Scaling)"]
+        GrimCapture["Screen Capture Engine (RAM Disk /dev/shm & Bounded Retention)"]
+        GroundingEngine["Visual Grounding Engine (In-BBox Point Validation)"]
+        VisualDiff["Visual Diff Engine (Pixel Threshold & UI Change Detection)"]
     end
 
     ScreenFeed --> GrimCapture
     GrimCapture --> GroundingEngine
-    GroundingEngine <--> OllamaVLM
-    GroundingEngine --> NavTools
+    GroundingEngine <--> OllamaVision
+    GroundingEngine --> CoordTrans
+    CoordTrans --> NavTools
     WaylandPointer -. "Action Dispatched" .-> ScreenFeed
     GrimCapture --> VisualDiff
     VisualDiff -. "Verification Feedback" .-> NavTools
@@ -132,7 +136,7 @@ flowchart TD
 
 ## 2. ReAct Cognitive Loop & Decision Pipeline
 
-The central reasoning engine executes an iterative **Reason + Act** cycle with context pruning, tool deduplication, and feedback collection.
+The central reasoning engine executes an iterative **Reason + Act** cycle with deterministic fast-path routing, context pruning, tool deduplication, and visual feedback collection.
 
 ```mermaid
 flowchart TD
@@ -146,19 +150,19 @@ flowchart TD
     ActiveGoalCheck -- Yes --> AugmentGoal["Augment Prompt with Active Goal Context"]
     ActiveGoalCheck -- No --> SetNewGoal["Record Active Goal"]
 
-    AugmentGoal --> GenPlan["Generate Arrow-Chain Workflow Plan"]
+    AugmentGoal --> GenPlan["Generate Workflow Plan (Templates / LLM)"]
     SetNewGoal --> GenPlan
-    GenPlan --> EnrichMemory["Recall Semantically Relevant Memories"]
+    GenPlan --> EnrichMemory["Recall Semantically Relevant Long-Term Memories"]
     EnrichMemory --> AssemblePrompt["Build System Prompt with Memory & Telemetry"]
 
     AssemblePrompt --> PruneCtx["Prune Context Window (<14 Recent Messages)"]
-    PruneCtx --> QueryLLM["Invoke LLM (Ollama / Groq Cascade)"]
+    PruneCtx --> PrepareLLM["ModelManager: Prepare Reasoning Core (qwen3:8b)"]
+    PrepareLLM --> QueryLLM["Invoke Ollama Chat API (Streaming User-Facing Path)"]
 
     QueryLLM --> ParseResp{"Contains Tool Calls?"}
 
     ParseResp -- No --> FinalReply["Format Final Assistant Message"]
-    FinalReply --> UnloadIdle["Unload Models from VRAM on Idle"]
-    UnloadIdle --> ReturnOutput(["Deliver Text & Speech to User"])
+    FinalReply --> ReturnOutput(["Deliver Text & Speech to User"])
 
     ParseResp -- Yes --> ToolLoop["Iterate Tool Calls"]
     ToolLoop --> DedupCheck{"Consecutive Duplicate Call?"}
@@ -166,7 +170,7 @@ flowchart TD
     DedupCheck -- Yes --> SuppressCall["Suppress Repeated Execution with Error"]
     SuppressCall --> AppendToolResult["Append Tool Error to Context"]
 
-    DedupCheck -- No --> SafetyEval["SafetyEngine: Evaluate Risk Tier"]
+    DedupCheck -- No --> SafetyEval["SafetyEngine: Evaluate Risk Tier & Prompt Injections"]
     SafetyEval --> RiskCheck{"Risk Tier Classification"}
 
     RiskCheck -- "Dangerous / Shell / Kill" --> AskConfirm{"Request Confirmation (CLI / Voice)"}
@@ -177,7 +181,7 @@ flowchart TD
     ToolRejected --> AppendToolResult
 
     FocusWorkspace --> ExecTool["Execute Tool Implementation"]
-    ExecTool --> PerfTimer["Record Execution Latency"]
+    ExecTool --> PerfTimer["Record Per-Stage Execution Latency"]
     PerfTimer --> AppendToolResult
 
     AppendToolResult --> MaxIterCheck{"Max Iterations Reached? (10)"}
@@ -190,37 +194,39 @@ flowchart TD
 
 ## 3. Closed-Loop GUI "Computer Use" Workflow
 
-For graphical user interface automation, J.A.R.V.I.S. employs a closed-loop **Observe ➔ Locate ➔ Act ➔ Verify** pipeline.
+For graphical user interface automation, J.A.R.V.I.S. prioritizes **DOM/Accessibility-first** interaction when controlling browsers, falling back to a robust closed-loop **Observe ➔ Locate ➔ Act ➔ Verify** visual pipeline for desktop apps.
 
 ```mermaid
 flowchart LR
     subgraph Step1 ["1. Observe"]
-        Capture["grim Screen Capture"]
-        RAMDisk["Save to /dev/shm (Zero Disk I/O)"]
+        Capture["ScreenCaptureEngine (grim)"]
+        RAMDisk["Save to /dev/shm (or /tmp) with max_frames=20"]
         Capture --> RAMDisk
     end
 
     subgraph Step2 ["2. Locate"]
-        VLM["Qwen 2.5-VL / Cloud VLM"]
-        CoordParser["Extract Bounding Box [ymin, xmin, ymax, xmax]"]
-        NormToPixel["Map Normalized Coords to Pixel (X, Y)"]
-        RAMDisk --> VLM
-        VLM --> CoordParser
-        CoordParser --> NormToPixel
+        VLMManager["ModelManager: Load Vision Core (qwen2.5vl:3b)"]
+        VLM["Ollama Vision Model"]
+        Parser["Parser: Independent BBox & Point Extraction"]
+        Transformer["CoordinateTransformer (Model Scale -> Screen Resolution)"]
+        RAMDisk --> VLMManager
+        VLMManager --> VLM
+        VLM --> Parser
+        Parser --> Transformer
     end
 
     subgraph Step3 ["3. Act"]
-        FocusWS["Switch Hyprland Workspace"]
-        SmoothMove["Move Cursor (Bezier Trajectory)"]
-        PointerDispatch["Dispatch Click (wayland_pointer / pyuserinput)"]
-        NormToPixel --> FocusWS
-        FocusWS --> SmoothMove
-        SmoothMove --> PointerDispatch
+        FocusWS["Switch & Verify Hyprland Workspace"]
+        SafetyCheck["Verify Point Strictly Inside Bounding Box"]
+        PointerDispatch["Dispatch Action (wlr-virtual-pointer / PyAutoGUI)"]
+        Transformer --> FocusWS
+        FocusWS --> SafetyCheck
+        SafetyCheck --> PointerDispatch
     end
 
     subgraph Step4 ["4. Verify"]
-        PostCapture["Post-Action Screenshot"]
-        DiffEngine["Visual Diff Engine (Pixel & Structural Diff)"]
+        PostCapture["Post-Action Capture (persistent=False)"]
+        DiffEngine["VisualDiffEngine (pixel_threshold=15 Filtering)"]
         StateCheck{"UI Changed?"}
         PointerDispatch --> PostCapture
         PostCapture --> DiffEngine
@@ -228,7 +234,7 @@ flowchart LR
     end
 
     StateCheck -- Yes --> SuccessOutcome(["Action Confirmed Successful"])
-    StateCheck -- No --> Recover(["Report Unchanged UI / Retry Coordinates"])
+    StateCheck -- No --> Recover(["Report Failure: Suppress Dangerous Clicks"])
 ```
 
 ---
@@ -237,14 +243,14 @@ flowchart LR
 
 | Subsystem | Key Modules | Primary Technologies | Key Functions & Responsibilities |
 |---|---|---|---|
-| **Voice In** | `voice/wake_word.py`<br>`voice/listener.py` | PipeWire (`pw-record`), Groq Whisper Large v3 Turbo, RMS Energy VAD | Wake-word detection ("Jarvis"), voice activity detection, streaming audio transcription (<300ms latency). |
+| **Voice In** | `voice/wake_word.py`<br>`voice/listener.py` | PipeWire (`pw-record`), Whisper STT, RMS Energy VAD | Wake-word detection ("Jarvis"), voice activity detection, streaming speech-to-text pipeline. |
 | **Voice Out** | `voice/speaker.py` | Microsoft Edge-TTS (`en-GB-RyanNeural`), `pw-play` / `ffplay` | British gentleman speech synthesis, streaming sentence pipelining, instant barge-in cut-off. |
-| **Cognitive Core** | `core/agent.py`<br>`core/fast_path.py`<br>`core/prompts.py` | Python 3, Pydantic, Custom ReAct Loop, Arrow Plan Generator | Orchestrates reasoning, maintains active goal tracking, token context pruning, reflex execution routing. |
-| **Model Manager** | `core/model_manager.py`<br>`core/llm_client.py` | Local Ollama API, Groq SDK, OpenAI SDK | Round-robin API key fallback, VRAM residency management (exclusive loading, auto-unload on idle). |
-| **Perception (Vision)** | `vision/capture.py`<br>`vision/grounding.py`<br>`vision/analyzer.py`<br>`vision/visual_diff.py` | `grim` (Wayland), PIL, Qwen 2.5-VL, Image Diffing | Zero-disk-I/O RAM screenshot capture, visual element coordinate grounding, UI change verification. |
-| **GUI Automation** | `gui_driver/navigator.py`<br>`gui_driver/mouse_keyboard.py`<br>`core/workspace.py` | Wayland `wlr-virtual-pointer`, PyAutoGUI, `hyprctl` | Smooth cursor motion, Wayland C pointer clicks, keyboard shortcuts, workspace isolation. |
-| **Browser DOM** | `tools/browser_dom.py` | Playwright, Google Chrome Headless/Headed | Sub-15ms DOM inspection, element query, text entry, and link traversal without vision overhead. |
-| **Safety Engine** | `core/safety.py` | Python Regex, Risk Tiers (`SAFE`, `MODERATE`, `DANGEROUS`) | Block dangerous shell patterns (fork bombs, `rm -rf /`), gate destructive actions behind user confirmation. |
+| **Cognitive Core** | `core/agent.py`<br>`core/fast_path.py`<br>`core/prompts.py` | Python 3, Pydantic, Custom ReAct Loop, Deterministic Workflow Templates | Orchestrates reasoning, maintains active goal tracking, token context pruning, reflex execution routing. |
+| **Model Manager** | `core/model_manager.py`<br>`core/llm_client.py` | Local Ollama API, Centralized Residency Manager | Exclusive VRAM residency on laptop GPUs (RTX 3050 4GB), mutual exclusion between reasoning and vision, configurable idle timeout. |
+| **Perception (Vision)** | `vision/capture.py`<br>`vision/coordinates.py`<br>`vision/grounding.py`<br>`vision/analyzer.py`<br>`vision/visual_diff.py` | `grim` (Wayland), Pillow, Qwen 2.5-VL via Ollama | Zero-disk-I/O RAM screenshot capture with bounded retention (20 frames), bidirectional coordinate scaling/clamping, pixel-thresholded UI diff detection. |
+| **GUI Automation** | `gui_driver/navigator.py`<br>`gui_driver/mouse_keyboard.py`<br>`core/workspace.py` | Wayland `wlr-virtual-pointer`, PyAutoGUI, `hyprctl` | Smooth cursor motion, Wayland C pointer clicks, keyboard shortcuts, verified workspace isolation. |
+| **Browser DOM** | `tools/browser_dom.py` | Playwright, Chromium Headless/Headed | Primary browser interface: sub-15ms DOM inspection, element query, text entry, and link traversal without vision overhead. |
+| **Safety Engine** | `core/safety.py` | Python Regex, Risk Tiers (`SAFE`, `MODERATE`, `DANGEROUS`) | Block dangerous shell patterns (fork bombs, `rm -rf /`), gate destructive actions behind user confirmation, filter untrusted screen prompts. |
 | **Persistent Memory** | `memory/store.py`<br>`tools/memory_ops.py` | Atomic JSON Storage, Semantic Keyword Scoring | Cross-session user preferences, profile attributes, conversation facts, and proactive prompt context. |
 | **System Tools** | `tools/app_control.py`<br>`tools/file_ops.py`<br>`tools/system_ctl.py`<br>`tools/system_info.py` | `hyprctl`, `psutil`, `gio`, `xdg-open`, `notify-send`, PipeWire | Launch/focus apps via Hyprland, safe file edits with diff preview, audio volume, hardware telemetry. |
 
@@ -252,18 +258,33 @@ flowchart LR
 
 ## 5. Architectural Invariants & Design Principles
 
-1. **Local-First & Resource-Mindful**:
-   - Primary reasoning and vision default to local GPU models (`qwen3:4b` and `qwen2.5vl:3b`) via Ollama.
-   - `OllamaModelManager` guarantees mutual exclusivity between reasoning and vision models to prevent VRAM competition, thermal throttling, and OOM panics on laptop GPUs.
-   - Auto-unloads models on idle to keep systems quiet and cool.
+1. **100% Local-First & Zero Cloud Leakage**:
+   - Primary reasoning (`qwen3:8b`) and visual grounding (`qwen2.5vl:3b`) run completely locally on GPU via Ollama.
+   - User desktop pixels, shell commands, and audio streams never leave the local machine.
 
-2. **Ultra-Low Latency Dual-Track Processing**:
+2. **Centralized VRAM Lifecycle Management**:
+   - Laptop GPUs (such as RTX 3050 4GB VRAM) cannot co-host an 8B LLM and a 3B VLM simultaneously.
+   - `OllamaModelManager` enforces strict mutual exclusion: loading the vision model unloads the reasoning model, and vice versa.
+   - Configurable idle timeouts prevent unnecessary GPU power draw and thermal throttling while avoiding redundant model reloads during active multi-turn tasks.
+
+3. **Standardized Coordinates & Safe Grounding**:
+   - Resized VLM images (e.g. max 1280px) are mapped strictly back to native screen resolution via `CoordinateTransformer`.
+   - Never fall back to center-screen clicks on visual grounding failure; failures return `None, None` to abort unsafe actions immediately.
+   - Click points are verified to lie strictly inside the detected bounding box before cursor dispatch.
+
+4. **Transient Capture Bounded Retention**:
+   - Perception and verification loops use temporary capture directories (`/dev/shm` RAM disk with `/tmp` fallback) with `persistent=False`.
+   - Bounded retention (`_cleanup_old_ram_frames`) automatically purges obsolete frames past 20 captures, preventing RAM/disk bloat.
+   - Permanent storage (`workspace/screenshots/`) is reserved strictly for explicit user-requested screenshots.
+
+5. **DOM-First, Vision as Fallback**:
+   - For web and browser interactions, deterministic DOM accessibility trees (`tools/browser_dom.py`) are prioritized for sub-15ms reliability.
+   - Vision-based closed-loop grounding is used for native desktop applications and canvas elements where accessibility trees are inaccessible.
+
+6. **Ultra-Low Latency Dual-Track Processing**:
    - **Track 1 (Fast-Path Reflex)**: Deterministic, regex-matched commands execute directly in `<15ms`, bypassing LLM round-trips entirely.
    - **Track 2 (Cognitive ReAct)**: Complex, exploratory tasks run through the multi-turn ReAct loop with arrow-chain workflow pre-planning.
 
-3. **Closed-Loop Verification**:
-   - GUI operations do not fire-and-forget; they verify state changes using pre- and post-action visual frame comparisons.
-
-4. **Multi-Tiered Safety Guardrails**:
+7. **Multi-Tiered Safety Guardrails & Untrusted Content Defense**:
    - Destructive operations (`safe_delete_file`, `terminate_process`, `execute_shell_command`) are gated by explicit interactive confirmation (CLI `y/N` or Voice `yes/no`).
-   - Critical catastrophic commands (fork bombs, direct drive writes) are intercepted and permanently blocked at the safety engine level.
+   - Untrusted text captured from screens or web pages is filtered to prevent indirect prompt injections from hijacking the agent.

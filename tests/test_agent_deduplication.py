@@ -157,3 +157,34 @@ def test_agent_preserves_active_goal_across_corrections():
     cancel_reply = agent.step("stop")
     assert agent.active_goal is None
     assert "cleared the active goal" in cancel_reply
+
+
+def test_new_task_not_hijacked_by_prior_observational_query():
+    registry = ToolRegistry()
+    mock_llm = MagicMock(spec=LLMClient)
+    mock_llm.chat.return_value = FakeChatResponse(FakeChatCompletionMessage(content="Understood, Sir."))
+
+    agent = JarvisAgent(llm_client=mock_llm, tool_registry=registry, enable_fast_path=False)
+
+    # Turn 1: Observational screen reading
+    agent.step("what do you see on the screen ?")
+    # Observational tasks must not leave a lingering active action goal
+    assert agent.active_goal is None
+
+    # Turn 2: New command with 7 words (previously hijacked by len <= 8 rule)
+    agent.step("chat with the chatgpt for 10 messages")
+    # Must be recognized as a NEW action task, not a follow-up to observation
+    assert agent.active_goal == "chat with the chatgpt for 10 messages"
+
+    last_user_msg = [m for m in agent.messages if m.get("role") == "user"][-1]["content"]
+    assert "[CURRENT ACTIVE OBJECTIVE]" not in last_user_msg
+    assert "what do you see on the screen" not in last_user_msg
+    assert last_user_msg == "chat with the chatgpt for 10 messages"
+
+    # Turn 3: Explicit continuation of the chatgpt task
+    agent.step("in the browser")
+    assert agent.active_goal == "chat with the chatgpt for 10 messages"
+    cont_user_msg = [m for m in agent.messages if m.get("role") == "user"][-1]["content"]
+    assert "[CURRENT ACTIVE OBJECTIVE]: chat with the chatgpt for 10 messages" in cont_user_msg
+    assert "[USER CORRECTION / DIRECTION]: in the browser" in cont_user_msg
+

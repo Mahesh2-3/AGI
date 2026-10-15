@@ -188,6 +188,7 @@ def test_agent_workflow_plan_generation():
         llm_client=mock_llm,
         tool_registry=ToolRegistry(),
         on_workflow_plan=lambda plan: planned_events.append(plan),
+        enable_fast_path=False,
     )
 
     test_input = "tell me what are you seeing on the screen"
