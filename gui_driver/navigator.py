@@ -18,7 +18,7 @@ class ClosedLoopNavigator:
     ) -> Dict[str, Any]:
         """Locates an element on screen, executes mouse click, and verifies visual update."""
         # 1. Observe: Capture baseline frame
-        baseline = capture_engine.capture_full_screen()
+        baseline = capture_engine.capture_full_screen(persistent=False)
 
         # 2. Decide: Locate coordinates using Vision Model
         loc = grounding_engine.locate_element(element_description, screenshot_path=baseline["path"])
@@ -30,8 +30,26 @@ class ClosedLoopNavigator:
                 "details": loc.get("description"),
             }
 
-        target_x = loc["x"]
-        target_y = loc["y"]
+        target_x = loc.get("x")
+        target_y = loc.get("y")
+
+        if target_x is None or target_y is None:
+            return {
+                "success": False,
+                "element": element_description,
+                "error": f"Visual grounding returned no actionable coordinates for '{element_description}'. Action suppressed.",
+                "details": loc.get("description"),
+            }
+
+        geom = capture_engine.get_display_geometry()
+        max_w = geom.get("width", 1920)
+        max_h = geom.get("height", 1080)
+        if not (0 <= target_x <= max_w and 0 <= target_y <= max_h):
+            return {
+                "success": False,
+                "element": element_description,
+                "error": f"Coordinates ({target_x}, {target_y}) exceed screen boundaries ({max_w}x{max_h}). Click suppressed.",
+            }
 
         # 3. Act: Smoothly move cursor to target center first, then click
         controller.move_to(target_x, target_y)
@@ -57,7 +75,7 @@ class ClosedLoopNavigator:
 
         # 4. Verify: Wait briefly for UI animation and capture result frame
         time.sleep(0.3)
-        after_frame = capture_engine.capture_full_screen()
+        after_frame = capture_engine.capture_full_screen(persistent=False)
         diff = diff_engine.compare_images(baseline["path"], after_frame["path"])
 
         if not diff["changed"]:
@@ -90,7 +108,7 @@ class ClosedLoopNavigator:
 
     def move_to_element(self, element_description: str) -> Dict[str, Any]:
         """Locates an element on screen and moves the cursor to its center without clicking."""
-        baseline = capture_engine.capture_full_screen()
+        baseline = capture_engine.capture_full_screen(persistent=False)
         loc = grounding_engine.locate_element(element_description, screenshot_path=baseline["path"])
         if not loc.get("found"):
             return {
@@ -100,8 +118,26 @@ class ClosedLoopNavigator:
                 "details": loc.get("description"),
             }
 
-        target_x = loc["x"]
-        target_y = loc["y"]
+        target_x = loc.get("x")
+        target_y = loc.get("y")
+        if target_x is None or target_y is None:
+            return {
+                "success": False,
+                "element": element_description,
+                "error": f"No actionable coordinates returned for '{element_description}'. Move cursor action suppressed.",
+                "details": loc.get("description"),
+            }
+
+        geom = capture_engine.get_display_geometry()
+        max_w = geom.get("width", 1920)
+        max_h = geom.get("height", 1080)
+        if not (0 <= target_x <= max_w and 0 <= target_y <= max_h):
+            return {
+                "success": False,
+                "element": element_description,
+                "error": f"Coordinates ({target_x}, {target_y}) exceed screen boundaries ({max_w}x{max_h}). Move cursor suppressed.",
+            }
+
         controller.move_to(target_x, target_y)
 
         return {
@@ -123,7 +159,16 @@ class ClosedLoopNavigator:
         verify: bool = True,
     ) -> Dict[str, Any]:
         """Directly clicks at given pixel coordinates (x, y) and verifies visual reaction."""
-        baseline = capture_engine.capture_full_screen() if verify else None
+        geom = capture_engine.get_display_geometry()
+        max_w = geom.get("width", 1920)
+        max_h = geom.get("height", 1080)
+        if not (0 <= x <= max_w and 0 <= y <= max_h):
+            return {
+                "success": False,
+                "error": f"Coordinates ({x}, {y}) exceed screen boundaries ({max_w}x{max_h}). Click suppressed.",
+            }
+
+        baseline = capture_engine.capture_full_screen(persistent=False) if verify else None
 
         controller.click(x, y, button=button)
 
@@ -135,7 +180,7 @@ class ClosedLoopNavigator:
             }
 
         time.sleep(0.3)
-        after_frame = capture_engine.capture_full_screen()
+        after_frame = capture_engine.capture_full_screen(persistent=False)
         diff = diff_engine.compare_images(baseline["path"], after_frame["path"])
 
         if not diff["changed"]:
@@ -174,7 +219,7 @@ class ClosedLoopNavigator:
 
         # 3. Verify screen change
         time.sleep(0.2)
-        after_frame = capture_engine.capture_full_screen()
+        after_frame = capture_engine.capture_full_screen(persistent=False)
 
         return {
             "success": True,

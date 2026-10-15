@@ -91,6 +91,24 @@ def test_click_coordinate_closed_loop():
         mock_click.assert_called_once_with(500, 82, button="left")
 
 
+def test_click_element_none_coordinates_suppressed():
+    with patch("gui_driver.navigator.grounding_engine.locate_element") as mock_locate, \
+         patch("gui_driver.navigator.controller.click") as mock_click:
+        mock_locate.return_value = {"found": True, "x": None, "y": None}
+        res = navigator.click_element("Ghost button")
+        assert res["success"] is False
+        assert "no actionable coordinates" in res["error"]
+        assert mock_click.call_count == 0
+
+
+def test_click_coordinate_out_of_bounds_suppressed():
+    with patch("gui_driver.navigator.controller.click") as mock_click:
+        res = navigator.click_coordinate(5000, 9999)
+        assert res["success"] is False
+        assert "exceed screen boundaries" in res["error"]
+        assert mock_click.call_count == 0
+
+
 if __name__ == "__main__":
     test_navigator_tools_registered()
     test_click_element_not_found()

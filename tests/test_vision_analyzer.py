@@ -82,3 +82,29 @@ def test_analyze_image_mock_ollama_call(tmp_path):
         assert res["found"] is True
         assert res["point"] == [192, 144]
         assert res["bbox_pixels"] == [64, 48, 320, 240]
+
+
+def test_parse_structured_response_point_only():
+    # Model returns valid point but omits bbox
+    raw_json = json.dumps({
+        "found": True,
+        "target": "Search icon",
+        "point": [0.5, 0.5],
+        "explanation": "Search magnifying glass at center",
+    })
+    res = _parse_structured_response(raw_json, orig_w=1920, orig_h=1080, target_query="Search icon")
+    assert res["success"] is True
+    assert res["found"] is True
+    assert res["point"] == [960, 540]
+    assert res["bbox_pixels"] == [960, 540, 960, 540]
+
+
+def test_parse_structured_response_missing_confidence():
+    # Confidence omitted by model should not be assumed as 0.95
+    raw_json = json.dumps({
+        "found": False,
+        "target": "Unknown element",
+    })
+    res = _parse_structured_response(raw_json, orig_w=1920, orig_h=1080)
+    assert res["confidence"] == 0.0
+

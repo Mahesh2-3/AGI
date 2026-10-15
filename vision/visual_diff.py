@@ -17,7 +17,10 @@ class VisualDiffEngine:
         image_b_path: str | Path,
         pixel_threshold: int = 15,
     ) -> Dict[str, Any]:
-        """Compares two images and calculates the percentage of changed pixels and bounding box."""
+        """Compares two images and calculates the percentage of changed pixels and bounding box.
+        
+        Applies pixel_threshold to filter out minor noise/compression artifacts.
+        """
         path_a = Path(image_a_path)
         path_b = Path(image_b_path)
 
@@ -35,18 +38,36 @@ class VisualDiffEngine:
             img_b_rgb = img_b.convert("RGB")
 
             diff = ImageChops.difference(img_a_rgb, img_b_rgb)
-            bbox = diff.getbbox()
 
-            # Calculate Root Mean Square (RMS) difference
+            # Apply pixel_threshold across channels to isolate meaningful pixel changes
+            r, g, b = diff.split()
+            mask_r = r.point(lambda p: 255 if p >= pixel_threshold else 0)
+            mask_g = g.point(lambda p: 255 if p >= pixel_threshold else 0)
+            mask_b = b.point(lambda p: 255 if p >= pixel_threshold else 0)
+            mask = ImageChops.lighter(ImageChops.lighter(mask_r, mask_g), mask_b)
+
+            # Calculate actual changed pixel count from thresholded mask
+            hist = mask.histogram()
+            changed_pixels = sum(hist[1:])
+            total_pixels = img_a.width * img_a.height
+            changed_pixel_percent = round((changed_pixels / total_pixels) * 100, 2)
+
+            # Bounding box of thresholded change
+            bbox = mask.getbbox()
+
+            # Calculate Root Mean Square (RMS) difference across entire image
             stat = ImageStat.Stat(diff)
             rms = math.sqrt(sum(v ** 2 for v in stat.rms) / len(stat.rms))
 
-            # Bounding box of change
-            changed = bbox is not None and rms > 1.0
+            changed = bbox is not None and changed_pixels > 0
 
-            change_info = {
+            change_info: Dict[str, Any] = {
                 "changed": changed,
                 "rms_difference": round(rms, 2),
+                "pixel_threshold": pixel_threshold,
+                "changed_pixel_count": changed_pixels,
+                "changed_pixel_percent": changed_pixel_percent,
+                "changed_area_percent": changed_pixel_percent,
                 "bounding_box": {
                     "left": bbox[0],
                     "top": bbox[1],
@@ -54,7 +75,7 @@ class VisualDiffEngine:
                     "bottom": bbox[3],
                     "width": bbox[2] - bbox[0],
                     "height": bbox[3] - bbox[1],
-                } if bbox else None,
+                } if (changed and bbox) else None,
                 "frame_size": {
                     "width": img_a.width,
                     "height": img_a.height,
@@ -64,11 +85,14 @@ class VisualDiffEngine:
             if changed and bbox:
                 w = bbox[2] - bbox[0]
                 h = bbox[3] - bbox[1]
-                area_ratio = round((w * h) / (img_a.width * img_a.height) * 100, 2)
-                change_info["changed_area_percent"] = area_ratio
-                change_info["summary"] = f"Visual update observed at region ({bbox[0]}, {bbox[1]}) spanning {w}x{h}px ({area_ratio}% of screen)."
+                bbox_area_ratio = round((w * h) / total_pixels * 100, 2)
+                change_info["bounding_box_area_percent"] = bbox_area_ratio
+                change_info["summary"] = (
+                    f"Visual update observed: {changed_pixels} changed pixels ({changed_pixel_percent}% of screen) "
+                    f"within region ({bbox[0]}, {bbox[1]}) spanning {w}x{h}px."
+                )
             else:
-                change_info["changed_area_percent"] = 0.0
+                change_info["bounding_box_area_percent"] = 0.0
                 change_info["summary"] = "No significant visual change detected between frames."
 
             return change_info
@@ -78,18 +102,29 @@ class VisualDiffEngine:
         baseline_shot_path: str | Path,
         timeout_seconds: float = 3.0,
         poll_interval: float = 0.25,
+        pixel_threshold: int = 15,
     ) -> Dict[str, Any]:
-        """Polls screen until a visual change occurs or timeout expires."""
+        """Polls screen using temporary frames until a visual change occurs or timeout expires."""
         start_t = time.perf_counter()
+        baseline_p = Path(baseline_shot_path)
+        if not baseline_p.exists():
+            raise FileNotFoundError(f"Baseline frame not found: {baseline_p}")
 
         while (time.perf_counter() - start_t) < timeout_seconds:
             time.sleep(poll_interval)
-            current_shot = capture_engine.capture_full_screen()
-            diff_res = self.compare_images(baseline_shot_path, current_shot["path"])
-            if diff_res["changed"]:
-                diff_res["elapsed_seconds"] = round(time.perf_counter() - start_t, 2)
-                diff_res["final_screenshot_path"] = current_shot["path"]
-                return diff_res
+            try:
+                # Capture frame to temporary storage to avoid polluting disk
+                current_shot = capture_engine.capture_full_screen(persistent=False)
+                if not current_shot or not current_shot.get("path") or not Path(current_shot["path"]).exists():
+                    continue
+
+                diff_res = self.compare_images(baseline_p, current_shot["path"], pixel_threshold=pixel_threshold)
+                if diff_res["changed"]:
+                    diff_res["elapsed_seconds"] = round(time.perf_counter() - start_t, 2)
+                    diff_res["final_screenshot_path"] = current_shot["path"]
+                    return diff_res
+            except Exception:
+                continue
 
         return {
             "changed": False,
@@ -102,5 +137,5 @@ diff_engine = VisualDiffEngine()
 
 
 @registry.register(description="Compares two screenshot images to detect visual UI changes, difference score, and bounding region.")
-def check_visual_difference(before_image_path: str, after_image_path: str) -> Dict[str, Any]:
-    return diff_engine.compare_images(before_image_path, after_image_path)
+def check_visual_difference(before_image_path: str, after_image_path: str, pixel_threshold: int = 15) -> Dict[str, Any]:
+    return diff_engine.compare_images(before_image_path, after_image_path, pixel_threshold=pixel_threshold)

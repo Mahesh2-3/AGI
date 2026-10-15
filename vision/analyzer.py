@@ -9,12 +9,13 @@ from typing import Any, Dict, Optional, Tuple, Union
 from PIL import Image
 
 from config.settings import settings
+from vision.coordinates import CoordinateTransformer
 
 logger = logging.getLogger("JARVIS.VisionAnalyzer")
 
 
-def _encode_image(image_path: Union[str, Path], max_dimension: int = 1280) -> Tuple[str, int, int]:
-    """Validates, reads, and Base64-encodes an image, returning (base64_str, width, height)."""
+def _encode_image(image_path: Union[str, Path], max_dimension: int = 1280) -> Tuple[str, int, int, int, int]:
+    """Validates, reads, and Base64-encodes an image, returning (base64_str, orig_w, orig_h, model_w, model_h)."""
     p = Path(image_path).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"Image file does not exist: {p}")
@@ -45,16 +46,18 @@ def _encode_image(image_path: Union[str, Path], max_dimension: int = 1280) -> Tu
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return b64_str, orig_w, orig_h
+    return b64_str, orig_w, orig_h, w, h
 
 
 def _parse_structured_response(
     raw_content: str,
     orig_w: int,
     orig_h: int,
+    model_w: Optional[int] = None,
+    model_h: Optional[int] = None,
     target_query: str = "",
 ) -> Dict[str, Any]:
-    """Extracts bounding boxes and structured coordinates from VLM response."""
+    """Extracts bounding boxes and structured coordinates from VLM response using standardized coordinate scaling."""
     text = raw_content.strip()
     # Strip markdown backticks
     if text.startswith("```"):
@@ -76,75 +79,76 @@ def _parse_structured_response(
             except Exception:
                 pass
 
+    transformer = CoordinateTransformer(
+        orig_w=orig_w,
+        orig_h=orig_h,
+        model_w=model_w or orig_w,
+        model_h=model_h or orig_h,
+    )
+
     if isinstance(parsed, dict):
         found = bool(parsed.get("found", True))
-        if not found or parsed.get("bbox") is None:
+        target_desc = parsed.get("target") or target_query
+        explanation = parsed.get("explanation") or parsed.get("description") or ""
+
+        # Validate confidence: never assume high confidence if omitted
+        raw_conf = parsed.get("confidence")
+        try:
+            confidence = max(0.0, min(1.0, float(raw_conf))) if raw_conf is not None else 0.0
+        except (ValueError, TypeError):
+            confidence = 0.0
+
+        # Parse bounding box independently
+        raw_box = parsed.get("bbox")
+        bbox_info = transformer.transform_bbox(raw_box) if raw_box else None
+
+        # Parse point independently
+        raw_point = parsed.get("point")
+        resolved_point = None
+        if raw_point and isinstance(raw_point, (list, tuple)) and len(raw_point) >= 2:
+            resolved_point = transformer.resolve_click_point(
+                raw_point,
+                bbox_info["bbox_pixels"] if bbox_info else None,
+            )
+
+        # If bbox exists but point was missing, derive click point from box center
+        if bbox_info and not resolved_point:
+            resolved_point = tuple(bbox_info["center"])
+
+        # Validate: target is found ONLY if found=True and at least one valid location was parsed
+        if not found or (bbox_info is None and resolved_point is None):
             return {
                 "success": True,
                 "found": False,
-                "target": parsed.get("target", target_query),
+                "target": target_desc,
                 "bbox": None,
                 "bbox_pixels": None,
                 "point": None,
-                "confidence": float(parsed.get("confidence", 0.0)),
-                "explanation": parsed.get("explanation") or parsed.get("description") or "Target element not located on screen.",
+                "confidence": confidence,
+                "explanation": explanation or "Target element not located on screen.",
                 "image_dimensions": {"width": orig_w, "height": orig_h},
             }
 
-        raw_box = parsed.get("bbox")
-        if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4:
-            b = [float(v) for v in raw_box]
-            # Detect coordinate format: normalized 0-1 vs pixel coordinates
-            if max(b) > 1.0:
-                # Returned as absolute pixels
-                px1, py1, px2, py2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
-                x1 = round(px1 / orig_w, 4)
-                y1 = round(py1 / orig_h, 4)
-                x2 = round(px2 / orig_w, 4)
-                y2 = round(py2 / orig_h, 4)
-            else:
-                # Returned as normalized [x1, y1, x2, y2]
-                x1, y1, x2, y2 = b[0], b[1], b[2], b[3]
-                px1 = int(round(x1 * orig_w))
-                py1 = int(round(y1 * orig_h))
-                px2 = int(round(x2 * orig_w))
-                py2 = int(round(y2 * orig_h))
+        point_list = [resolved_point[0], resolved_point[1]] if resolved_point else None
+        bbox_norm = bbox_info["bbox"] if bbox_info else (
+            [round(point_list[0] / orig_w, 4), round(point_list[1] / orig_h, 4),
+             round(point_list[0] / orig_w, 4), round(point_list[1] / orig_h, 4)] if point_list else None
+        )
+        bbox_px = bbox_info["bbox_pixels"] if bbox_info else (
+            [point_list[0], point_list[1], point_list[0], point_list[1]] if point_list else None
+        )
 
-            cx = int(round((px1 + px2) / 2))
-            cy = int(round((py1 + py2) / 2))
-
-            return {
-                "success": True,
-                "found": True,
-                "target": parsed.get("target", target_query),
-                "bbox": [x1, y1, x2, y2],
-                "bbox_pixels": [px1, py1, px2, py2],
-                "point": [cx, cy],
-                "confidence": float(parsed.get("confidence", 0.9)),
-                "explanation": parsed.get("explanation") or parsed.get("description") or f"Identified {target_query} at ({cx}, {cy}).",
-                "image_dimensions": {"width": orig_w, "height": orig_h},
-            }
-
-        # Check for single point
-        point = parsed.get("point")
-        if isinstance(point, (list, tuple)) and len(point) == 2:
-            pt = [float(v) for v in point]
-            if max(pt) > 1.0:
-                cx, cy = int(pt[0]), int(pt[1])
-            else:
-                cx = int(round(pt[0] * orig_w))
-                cy = int(round(pt[1] * orig_h))
-            return {
-                "success": True,
-                "found": True,
-                "target": parsed.get("target", target_query),
-                "bbox": [round(cx / orig_w, 4), round(cy / orig_h, 4), round(cx / orig_w, 4), round(cy / orig_h, 4)],
-                "bbox_pixels": [cx, cy, cx, cy],
-                "point": [cx, cy],
-                "confidence": float(parsed.get("confidence", 0.85)),
-                "explanation": parsed.get("explanation") or f"Located target at ({cx}, {cy}).",
-                "image_dimensions": {"width": orig_w, "height": orig_h},
-            }
+        return {
+            "success": True,
+            "found": True,
+            "target": target_desc,
+            "bbox": bbox_norm,
+            "bbox_pixels": bbox_px,
+            "point": point_list,
+            "confidence": confidence if raw_conf is not None else 0.85,
+            "explanation": explanation or f"Located target at ({point_list[0]}, {point_list[1]}).",
+            "image_dimensions": {"width": orig_w, "height": orig_h},
+        }
 
     # Could not parse structured JSON but got raw text
     return {
@@ -168,7 +172,7 @@ def analyze_image(
     base_url: Optional[str] = None,
     timeout: int = 45,
 ) -> Dict[str, Any]:
-    """Analyzes an image using local Qwen2.5-VL via Ollama.
+    """Analyzes an image using local Qwen2.5-VL via Ollama with standardized coordinate tracking.
 
     Args:
         image_path: Path to image file or captured screenshot.
@@ -184,9 +188,9 @@ def analyze_image(
     target_model = model or getattr(settings, "OLLAMA_VLM_MODEL", "qwen2.5vl:3b")
     endpoint_url = (base_url or getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
 
-    # 1. Validate and encode image
+    # 1. Validate and encode image (tracking both screen and model dimensions)
     try:
-        b64_img, orig_w, orig_h = _encode_image(image_path)
+        b64_img, orig_w, orig_h, model_w, model_h = _encode_image(image_path)
     except FileNotFoundError as e:
         return {"success": False, "error": f"Image not found: {e}", "found": False}
     except ValueError as e:
@@ -205,32 +209,35 @@ def analyze_image(
         formatted_prompt = (
             f"You are the visual grounding engine of a desktop AI assistant.\n"
             f"User request: {prompt}\n"
-            f"Image dimensions: {orig_w}x{orig_h}.\n\n"
+            f"Image dimensions: {model_w}x{model_h} (Original screen resolution: {orig_w}x{orig_h}).\n\n"
             f"Identify the exact requested target in the image and return ONLY a JSON object with this format:\n"
             f"{{\n"
             f'  "found": true,\n'
             f'  "target": "description of matched element",\n'
             f'  "bbox": [x1, y1, x2, y2],\n'
-            f'  "confidence": 0.95,\n'
+            f'  "point": [x, y],\n'
+            f'  "confidence": 0.9,\n'
             f'  "explanation": "short visual explanation"\n'
             f"}}\n"
             f"Rules:\n"
             f"- Coordinates [x1, y1, x2, y2] must be normalized between 0.0 and 1.0 (origin [0, 0] at top-left).\n"
+            f"- point [x, y] contains the click coordinates inside the element.\n"
             f"- Locate the interactive control or window, not decorative space.\n"
-            f"- If the target is missing or obscured, return found=false and bbox=null.\n"
+            f"- If the target is missing or obscured, return found=false, bbox=null, and point=null.\n"
             f"- NEVER invent coordinates.\n"
             f"- Output ONLY valid JSON, no markdown backticks or commentary."
         )
 
-    # 3. Model residency management: ensure reasoning models are unloaded to free RTX 3050 VRAM
+    # 3. Model residency management: ensure reasoning models are unloaded to free GPU VRAM
     try:
         from core.model_manager import model_manager
         model_manager.prepare_for_model(target_model)
     except Exception:
         pass
 
-    # 4. Dispatch request to Ollama /api/chat
+    # 4. Dispatch request to Ollama /api/chat with task-specific token limits and centralized keep_alive
     chat_url = f"{endpoint_url}/api/chat"
+    idle_timeout = getattr(settings, "OLLAMA_IDLE_TIMEOUT_SECONDS", 300)
     payload = {
         "model": target_model,
         "messages": [
@@ -241,10 +248,10 @@ def analyze_image(
             }
         ],
         "stream": False,
-        "keep_alive": 0,  # Unload immediately after inference to prevent GPU memory/heating spikes
+        "keep_alive": idle_timeout,
         "options": {
             "temperature": 0.0 if is_structured else 0.2,
-            "num_predict": 400 if is_structured else 600,
+            "num_predict": 200 if is_structured else 400,
         },
     }
     if is_structured:
@@ -292,16 +299,17 @@ def analyze_image(
             "found": False,
         }
     finally:
-        # Guarantee vision model is purged from GPU VRAM after call
+        # Centralized lifecycle management: mark active and apply idle policy
         try:
             from core.model_manager import model_manager
-            model_manager.unload_model(target_model)
+            model_manager.mark_active()
+            model_manager.unload_on_idle(force=False)
         except Exception:
             pass
 
     # 5. Format and return output
     if is_structured:
-        result = _parse_structured_response(raw_content, orig_w, orig_h, target_query=prompt)
+        result = _parse_structured_response(raw_content, orig_w, orig_h, model_w, model_h, target_query=prompt)
         result["raw_response"] = raw_content
         return result
 

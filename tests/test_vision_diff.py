@@ -38,6 +38,39 @@ def test_visual_diff_detection(tmp_path):
     assert bbox["top"] <= 55
     assert bbox["right"] >= 95
     assert bbox["bottom"] >= 95
+    assert diff_res["changed_pixel_count"] > 0
+    assert diff_res["changed_pixel_percent"] > 0
+
+
+def test_visual_diff_pixel_threshold(tmp_path):
+    img_a_path = tmp_path / "frame_base.jpg"
+    img_b_path = tmp_path / "frame_noise.jpg"
+
+    # Base image with neutral gray
+    img_a = Image.new("RGB", (50, 50), color=(100, 100, 100))
+    img_a.save(str(img_a_path))
+
+    # Modified image with subtle variation of +5 (compression / rendering artifact)
+    img_b = Image.new("RGB", (50, 50), color=(105, 105, 105))
+    img_b.save(str(img_b_path))
+
+    # With default threshold=15, subtle variation (+5) must be ignored
+    res_filtered = diff_engine.compare_images(img_a_path, img_b_path, pixel_threshold=15)
+    assert res_filtered["changed"] is False
+    assert res_filtered["changed_pixel_count"] == 0
+
+    # With sensitive threshold=3, variation (+5) is detected
+    res_detected = diff_engine.compare_images(img_a_path, img_b_path, pixel_threshold=3)
+    assert res_detected["changed"] is True
+    assert res_detected["changed_pixel_count"] == 50 * 50
+
+
+def test_wait_for_ui_update_timeout(tmp_path):
+    img_a_path = tmp_path / "baseline.jpg"
+    Image.new("RGB", (50, 50), color=(255, 255, 255)).save(str(img_a_path))
+    res = diff_engine.wait_for_ui_update(img_a_path, timeout_seconds=0.1, poll_interval=0.05)
+    assert "changed" in res
+    assert "elapsed_seconds" in res
 
 
 if __name__ == "__main__":
@@ -45,4 +78,7 @@ if __name__ == "__main__":
     from tempfile import TemporaryDirectory
     with TemporaryDirectory() as tmp:
         test_visual_diff_detection(Path(tmp))
+        test_visual_diff_pixel_threshold(Path(tmp))
+        test_wait_for_ui_update_timeout(Path(tmp))
     print("✅ All visual diff tests passed successfully!")
+

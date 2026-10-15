@@ -86,6 +86,15 @@ def test_parse_coordinate_response():
     assert extracted["y"] == round(0.3 * 1080)
     assert extracted["bbox"] == [0.1, 0.2, 0.3, 0.4]
 
+    # 5. Not found must NOT return screen center coordinates
+    not_found_json = '{"found": false, "target": "Submit"}'
+    parsed_nf = engine._parse_coordinate_response(not_found_json, 1920, 1080)
+    assert parsed_nf["found"] is False
+    assert parsed_nf["x"] is None
+    assert parsed_nf["y"] is None
+    assert parsed_nf["point"] is None
+    assert parsed_nf["confidence"] == 0.0
+
 
 def test_inspect_screen_with_user_prompt():
     engine = VisualGroundingEngine()

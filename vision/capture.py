@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -12,8 +13,11 @@ from config.settings import settings
 from core.workspace import workspace_manager
 from tools.base import registry
 
+logger = logging.getLogger("jarvis.vision.capture")
+
 # High-speed in-memory RAM disk (/dev/shm) for zero disk I/O during visual perception loops
 RAM_DISK_DIR = Path("/dev/shm/jarvis_screen") if Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK) else None
+FALLBACK_TEMP_DIR = Path("/tmp/jarvis_screen")
 PERSISTENT_SCREENSHOTS_DIR = settings.WORKSPACE_DIR / "screenshots"
 
 
@@ -25,12 +29,71 @@ class ScreenCaptureEngine:
         self.persistent_dir.mkdir(parents=True, exist_ok=True)
         # Store screenshots directly in workspace screenshots folder
         self.screenshots_dir = self.persistent_dir
-        self.ram_dir = RAM_DISK_DIR
+
+        # Temporary destination for transient perception loops (RAM disk or /tmp)
+        self.temp_dir = RAM_DISK_DIR if RAM_DISK_DIR is not None else FALLBACK_TEMP_DIR
+        try:
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            self.temp_dir = FALLBACK_TEMP_DIR
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+
+        self.ram_dir = self.temp_dir
         self.has_grim = bool(shutil.which("grim"))
 
-    def _cleanup_old_ram_frames(self, max_frames: int = 20):
-        """Preserves all captured screenshot history without deletion."""
-        pass
+    def _cleanup_old_ram_frames(self, max_frames: int = 20) -> None:
+        """Enforces bounded retention on temporary frames to prevent memory/disk bloat."""
+        try:
+            if not self.temp_dir or not self.temp_dir.exists():
+                return
+            files = [f for f in self.temp_dir.iterdir() if f.is_file()]
+            if len(files) > max_frames:
+                files.sort(key=lambda f: f.stat().st_mtime)
+                for old_file in files[:-max_frames]:
+                    try:
+                        old_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        except Exception as e:
+            logger.warning(f"Failed to cleanup old temporary frames: {e}")
+
+    def _sanitize_output_path(
+        self,
+        output_path: Optional[str | Path],
+        prefix: str = "screen",
+        persistent: bool = True,
+    ) -> Path:
+        """Sanitizes user or LLM supplied output paths, avoiding root/unwritable locations like /workspace."""
+        base_dir = self.persistent_dir if persistent else self.temp_dir
+
+        if not output_path:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+            target = base_dir / f"{prefix}_{timestamp}.jpg"
+            if not persistent:
+                self._cleanup_old_ram_frames()
+            return target
+
+        p = Path(output_path)
+        # Prevent permission errors from sandbox paths (e.g. /workspace/...) or non-absolute paths
+        if str(p).startswith("/workspace") or not p.is_absolute():
+            sanitized = base_dir / p.name
+        else:
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                sanitized = p.resolve()
+            except (PermissionError, OSError):
+                sanitized = base_dir / p.name
+
+        try:
+            sanitized.parent.mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError):
+            sanitized = base_dir / p.name
+            sanitized.parent.mkdir(parents=True, exist_ok=True)
+
+        if not persistent:
+            self._cleanup_old_ram_frames()
+
+        return sanitized
 
     def get_display_geometry(self) -> Dict[str, Any]:
         """Queries monitor resolution and active workspace."""
@@ -49,8 +112,11 @@ class ScreenCaptureEngine:
                         "active_workspace": primary.get("activeWorkspace", {}).get("name"),
                         "active_workspace_id": primary.get("activeWorkspace", {}).get("id", 1),
                     }
-            except Exception:
-                pass
+                logger.warning("hyprctl monitors returned empty list; falling back to 1920x1080 default.")
+            except Exception as e:
+                logger.warning(f"Failed to query monitor geometry via hyprctl ({e}); falling back to 1920x1080 default.")
+        else:
+            logger.warning("hyprctl not found on system; falling back to 1920x1080 default display geometry.")
         return {"width": 1920, "height": 1080, "scale": 1.0, "active_workspace": "1", "active_workspace_id": 1}
 
     def capture_full_screen(
@@ -60,14 +126,8 @@ class ScreenCaptureEngine:
         quality: int = 80,
         persistent: bool = True,
     ) -> Dict[str, Any]:
-        """Captures full desktop screenshot and saves to screenshots folder."""
-        if not output_path:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-            output_path = self.persistent_dir / f"screen_{timestamp}.jpg"
-        else:
-            output_path = Path(output_path).resolve()
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        """Captures full desktop screenshot and saves to destination (persistent or temporary)."""
+        output_path = self._sanitize_output_path(output_path, prefix="screen", persistent=persistent)
         # Ensure Jarvis's working workspace is active on the monitor before capturing
         workspace_manager.ensure_working_workspace_active()
         start_t = time.perf_counter()
@@ -109,13 +169,7 @@ class ScreenCaptureEngine:
         persistent: bool = False,
     ) -> Dict[str, Any]:
         """Captures a specific region of the screen (x, y, w, h)."""
-        if not output_path:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-            output_path = self.persistent_dir / f"region_{timestamp}.jpg"
-        else:
-            output_path = Path(output_path).resolve()
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path = self._sanitize_output_path(output_path, prefix="region", persistent=persistent)
         # Ensure Jarvis's working workspace is active on the monitor before capturing
         workspace_manager.ensure_working_workspace_active()
         start_t = time.perf_counter()
@@ -146,6 +200,7 @@ class ScreenCaptureEngine:
         query: str,
         output_path: Optional[str | Path] = None,
         quality: int = 80,
+        persistent: bool = True,
     ) -> Dict[str, Any]:
         """Locates an open window by title or class and captures only its bounding box."""
         query = query.strip().lower()
@@ -165,13 +220,29 @@ class ScreenCaptureEngine:
                                 active_id = json.loads(active_res.stdout).get("id")
                                 if c_ws != active_id:
                                     subprocess.run(
-                                        ["hyprctl", "repl", f"return hl.dispatch(hl.dsp.focus({{ workspace = {c_ws} }}))"],
+                                        ["hyprctl", "dispatch", "workspace", str(c_ws)],
                                         capture_output=True,
                                         text=True,
                                     )
-                                    time.sleep(0.15)
-                            except Exception:
-                                pass
+                                    # Verify workspace switch succeeded
+                                    switched = False
+                                    for _ in range(6):
+                                        time.sleep(0.05)
+                                        v_res = subprocess.run(["hyprctl", "activeworkspace", "-j"], capture_output=True, text=True)
+                                        if json.loads(v_res.stdout).get("id") == c_ws:
+                                            switched = True
+                                            break
+                                    if not switched:
+                                        logger.warning(f"Workspace switch to {c_ws} may not have completed; re-checking active workspace.")
+
+                                    # Re-query client geometry on the newly focused workspace
+                                    updated_res = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True)
+                                    for updated_c in json.loads(updated_res.stdout):
+                                        if updated_c.get("address") == c.get("address"):
+                                            c = updated_c
+                                            break
+                            except Exception as e:
+                                logger.warning(f"Failed verifying workspace switch in capture_window: {e}")
 
                         at = c.get("at", [0, 0])
                         size = c.get("size", [800, 600])
@@ -182,6 +253,7 @@ class ScreenCaptureEngine:
                             height=size[1],
                             output_path=output_path,
                             quality=quality,
+                            persistent=persistent,
                         )
                         result["window_title"] = c.get("title")
                         result["window_class"] = c.get("class")
@@ -203,4 +275,4 @@ def take_screenshot(include_cursor: bool = False, output_path: Optional[str] = N
 
 @registry.register(description="Captures a screenshot of a specific application window by title or name.")
 def capture_window_screenshot(window_name: str) -> Dict[str, Any]:
-    return capture_engine.capture_window(query=window_name)
+    return capture_engine.capture_window(query=window_name, persistent=True)
