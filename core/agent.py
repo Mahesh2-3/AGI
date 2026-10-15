@@ -7,12 +7,34 @@ from typing import Any, Callable, Dict, List, Optional
 from core.fast_path import FastPathRouter
 from core.llm_client import LLMClient
 from config.settings import settings
+from core.model_manager import model_manager
 from core.prompts import get_system_prompt
 from core.safety import SafetyEngine
 from core.workspace import workspace_manager
 from memory.store import MemoryStore, memory_store as default_memory_store
 from tools.base import ToolRegistry, ToolResult, registry as default_registry
 from vision.grounding import grounding_engine
+
+CLASSIFIER_SYSTEM_PROMPT = """You are the semantic intent classifier for Jarvis, an autonomous desktop AI assistant.
+Analyze the user request given the current desktop agent context and classify the intent into exactly one of the allowed categories.
+
+ALLOWED INTENTS:
+- "new_task": An independent request for Jarvis to operate desktop tools, launch applications, automate workflows, interact with websites or software (e.g., "open terminal", "launch chrome", "play music on spotify", "chat with chatgpt for 10 messages", "look at the screen and click submit", "search for weather"). Any compound request combining inspection and desktop actions (view+act) is "new_task".
+- "continuation": Resumes, corrects, retries, modifies, or adds instructions to an existing active task or recent workflow (e.g., "do the same in Chrome", "click the other one", "that didn't work", "close it", "try again", "already opened one", "yes, proceed").
+- "observational": Purely inspect, read, or describe the current screen WITHOUT interacting with desktop UI (e.g., "what do you see on the screen", "read my screen", "describe what is visible").
+- "general": Conversational questions, chit-chat, explanations, or responses addressed directly to Jarvis that do NOT require desktop actions or tools (e.g., "What is Python?", "How are you?", "Tell me a joke", "thank you", "hello"). Even if an active goal exists, general knowledge or conversational questions remain "general".
+- "cancel": Explicit request to abort, stop, cancel, or clear the current active task (e.g., "cancel this", "stop what you are doing", "abort task"). Do not classify desktop UI actions like closing an application, window, or tab ("close it", "close Chrome") as cancel; closing an application or tab is an action task ("continuation" or "new_task").
+
+CONTEXT RESOLUTION:
+Resolve context-dependent pronouns, references, and relative instructions (such as "do the same in Chrome", "click the other one", "that didn't work", "close it") into concrete, explicit instructions in "resolved_action" using the Active Goal, Previous Goal, Execution Status, and Recent Conversation History.
+
+OUTPUT FORMAT:
+Respond with ONLY valid JSON:
+{
+  "intent": "new_task" | "continuation" | "observational" | "general" | "cancel",
+  "resolved_action": "<clarified/resolved action or request resolving pronouns like 'it', 'the other one', 'same'>",
+  "reasoning": "<short explanation>"
+}"""
 
 
 class JarvisAgent:
@@ -30,6 +52,8 @@ class JarvisAgent:
         on_tool_call: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_tool_result: Optional[Callable[..., None]] = None,
         on_workflow_plan: Optional[Callable[[str], None]] = None,
+        on_token: Optional[Callable[[str], None]] = None,
+        enable_streaming: bool = False,
     ):
         self.llm = llm_client or LLMClient()
         self.registry = tool_registry or default_registry
@@ -37,19 +61,39 @@ class JarvisAgent:
         self.memory = memory_store or default_memory_store
         self.max_iterations = max_iterations
         self.enable_fast_path = enable_fast_path
+        self.enable_streaming = enable_streaming
         self.fast_path = FastPathRouter(registry=self.registry, safety=self.safety)
+
+        # Context caching (A5)
+        self._cached_base_prompt: Optional[str] = None
+        self._cached_memory_context: Optional[str] = None
+
         self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self._build_system_prompt()}
         ]
-        
+
         # Event callbacks for CLI / UI hooks
         self.on_thought = on_thought
         self.on_tool_call = on_tool_call
         self.on_tool_result = on_tool_result
         self.on_workflow_plan = on_workflow_plan
+        self.on_token = on_token
+
         self.failed_operations: List[Dict[str, Any]] = []
         self.last_step_duration: float = 0.0
         self.active_goal: Optional[str] = None
+        self.last_completed_goal: Optional[str] = None
+
+        # Per-stage performance measurements (A4)
+        self.last_turn_metrics: Dict[str, Any] = {
+            "planning_duration_s": 0.0,
+            "model_prep_duration_s": 0.0,
+            "llm_requests": [],
+            "tool_executions": [],
+            "total_duration_s": 0.0,
+            "iterations": 0,
+            "streamed": False,
+        }
 
     @staticmethod
     def format_duration(seconds: float) -> str:
@@ -69,8 +113,14 @@ class JarvisAgent:
         self.last_step_duration = elapsed
         return reply.rstrip()
 
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """Returns the granular per-stage latency breakdown of the most recent turn (A4)."""
+        return self.last_turn_metrics
+
     def _build_system_prompt(self, user_query: Optional[str] = None) -> str:
-        """Constructs system prompt augmented with proactive long-term memory & relevant recalled facts."""
+        """Constructs system prompt augmented with proactive long-term memory & relevant recalled facts.
+        Caches prompt if context has not changed (A5).
+        """
         core_mem = self.memory.get_context_summary()
         recalled_section = ""
         if user_query:
@@ -80,18 +130,27 @@ class JarvisAgent:
                 recalled_section = "• Relevant Recalled Memories for this instruction:\n" + "\n".join(recalled_lines)
 
         full_mem_context = f"{core_mem}\n{recalled_section}".strip()
-        return get_system_prompt(memory_context=full_mem_context)
+        if self._cached_base_prompt and self._cached_memory_context == full_mem_context:
+            return self._cached_base_prompt
+
+        prompt = get_system_prompt(memory_context=full_mem_context)
+        self._cached_base_prompt = prompt
+        self._cached_memory_context = full_mem_context
+        return prompt
 
     def reset(self):
         """Clears working memory back to the initial system prompt."""
+        self._cached_base_prompt = None
+        self._cached_memory_context = None
         self.messages = [
             {"role": "system", "content": self._build_system_prompt()}
         ]
         self.failed_operations = []
         self.active_goal = None
+        self.last_completed_goal = None
 
-    def _prune_context(self, max_recent: int = 14) -> List[Dict[str, Any]]:
-        """Maintains a slim context window to prevent exceeding Groq TPM (Tokens Per Minute) limits."""
+    def _prune_context(self, max_recent: int = 12) -> List[Dict[str, Any]]:
+        """Maintains a slim context window to prevent memory bloat and model confusion (A5)."""
         if len(self.messages) <= max_recent + 2:
             return self.messages
 
@@ -158,44 +217,43 @@ class JarvisAgent:
                                         results.append(parsed)
                                 except Exception:
                                     pass
-                                start = -1
-                escape = False
             return results
 
-        all_dicts = []
-        for text in candidates:
+        tool_calls = []
+        for candidate in candidates:
+            # Check if directly valid JSON object or list
             try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict):
-                    all_dicts.append(parsed)
-                elif isinstance(parsed, list):
-                    for item in parsed:
+                data = json.loads(candidate)
+                if isinstance(data, list):
+                    for item in data:
                         if isinstance(item, dict):
-                            all_dicts.append(item)
+                            tool_calls.append(item)
+                elif isinstance(data, dict):
+                    tool_calls.append(data)
             except Exception:
-                all_dicts.extend(_extract_balanced_json(text))
+                # Extract embedded balanced JSON structures
+                tool_calls.extend(_extract_balanced_json(candidate))
 
         valid_calls = []
-        for item in all_dicts:
-            fn_name = item.get("name") or item.get("function") or item.get("tool")
-            if not fn_name or not isinstance(fn_name, str):
+        for call_data in tool_calls:
+            fn_name = None
+            args = {}
+            if "name" in call_data and ("arguments" in call_data or "parameters" in call_data):
+                fn_name = call_data["name"]
+                args = call_data.get("arguments", call_data.get("parameters", {}))
+            elif "function" in call_data:
+                fn_info = call_data["function"]
+                if isinstance(fn_info, dict):
+                    fn_name = fn_info.get("name")
+                    args = fn_info.get("arguments", fn_info.get("parameters", {}))
+                elif isinstance(fn_info, str):
+                    fn_name = fn_info
+                    args = call_data.get("arguments", call_data.get("parameters", {}))
+
+            if not fn_name:
                 continue
 
-            tool_obj = self.registry.get_tool(fn_name)
-            if not tool_obj:
-                continue
-
-            args = item.get("arguments", item.get("parameters", {}))
-            if not args and any(k not in ("name", "function", "tool", "type") for k in item.keys()):
-                args = {k: v for k, v in item.items() if k not in ("name", "function", "tool", "type")}
-
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    pass
-
-            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            call_id = call_data.get("id") or f"call_{uuid.uuid4().hex[:8]}"
             valid_calls.append(
                 SimpleNamespace(
                     id=call_id,
@@ -210,33 +268,11 @@ class JarvisAgent:
         return valid_calls
 
     def _generate_workflow_via_llm(self, user_input: str) -> Optional[str]:
-        """Queries LLM for a fast one-line conditional arrow-chain workflow."""
-        prompt = (
-            "Generate a high-level execution workflow for desktop AI assistant Jarvis.\n"
-            "Format strictly as a single line using ' -> ' between steps, including conditional 'if' and 'else'.\n"
-            "Example: see the screen -> if browser has github tab that contains a repo -> go to the commits -> analyze commits using DOM -> else tell the user there is no github tab is opened\n\n"
-            f"User request: {user_input}\n"
-            "Workflow:"
-        )
-        try:
-            resp = self.llm.chat(
-                messages=[
-                    {"role": "system", "content": "You are a desktop AI workflow planner. Output ONLY the single-line arrow chain."},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=80,
-                temperature=0.1,
-            )
-            raw = resp.choices[0].message.content.strip()
-            raw = raw.strip('"`\n ')
-            if "->" in raw:
-                return raw.split("\n")[0].strip()
-        except Exception:
-            return None
+        """Optional dynamic workflow synthesis helper. Disabled by default to eliminate redundant pre-ReAct LLM calls (A1)."""
         return None
 
     def generate_workflow_plan(self, user_input: str) -> str:
-        """Constructs a conditional arrow-chained workflow plan (step -> if ... -> else ...) for user inspection."""
+        """Constructs a deterministic conditional arrow-chained workflow plan without extra LLM round-trips (A1)."""
         prompt_lower = user_input.lower().strip()
 
         # Check for explicit arrow chains e.g. "step 1 -> step 2 -> step 3"
@@ -244,7 +280,7 @@ class JarvisAgent:
             parts = [p.strip() for p in user_input.split("->") if p.strip()]
             return " -> ".join(parts)
 
-        # 1. Commits / GitHub / Repository inspection (e.g. user directive)
+        # 1. Commits / GitHub / Repository inspection
         if any(w in prompt_lower for w in ["commit", "commits", "repository", "repo", "github"]):
             return (
                 "see the screen -> if browser has github tab that contains a repo -> "
@@ -259,13 +295,22 @@ class JarvisAgent:
             "look at screen", "read screen", "read the screen", "read my screen",
             "screen description", "what is on the screen", "what's on the screen",
             "what is on my screen", "what's on my screen", "describe screen", "describe the screen",
+            "tell me what you see",
         ]):
             return (
                 "capture screenshot -> inspect screen with context-aware VLM -> "
                 "present visual observations to user"
             )
 
-        # 3. Existing Open Window / Interaction without opening duplicate sessions
+        # 3. Conversational / Web App Chat Interaction (ChatGPT, Claude, messaging)
+        if any(w in prompt_lower for w in ["chatgpt", "chat with", "talk to", "send a message", "message on", "talk with"]):
+            return (
+                "check open windows -> if target app is open -> focus window -> "
+                "locate message input field -> type message and submit -> "
+                "observe response"
+            )
+
+        # 4. Existing Open Window / Interaction without opening duplicate sessions
         if any(phrase in prompt_lower for phrase in [
             "don't open new", "do not open new", "already opened", "already open",
             "currently open", "existing window", "existing browser"
@@ -325,68 +370,318 @@ class JarvisAgent:
                 "type text payload -> verify input state -> else report input field missing"
             )
 
-        # 9. Dynamic synthesis via LLM if configured, otherwise structured conditional fallback
-        if getattr(self.llm, "is_configured", False):
-            try:
-                llm_plan = self._generate_workflow_via_llm(user_input)
-                if llm_plan:
-                    return llm_plan
-            except Exception:
-                pass
+        # 9. Audio / Volume / System telemetry
+        if any(w in prompt_lower for w in ["volume", "mute", "unmute", "audio", "battery", "telemetry", "status"]):
+            return (
+                "query system status -> apply requested setting -> verify state -> report to user"
+            )
 
+        # 10. Process / Shell execution
+        if any(w in prompt_lower for w in ["run", "execute", "shell", "bash", "command", "process", "kill", "terminate"]):
+            return (
+                "evaluate command safety tier -> execute action -> capture output -> report result to user"
+            )
+
+        # 11. Deterministic conversational fallback (eliminates pre-ReAct LLM call)
         return (
             "analyze user request -> identify target application -> "
             "dispatch actions -> if action succeeds -> verify outcome -> "
             "else report issue to user"
         )
 
-    def step(self, user_input: str) -> str:
-        """Processes a user input through the autonomous ReAct cycle."""
+    def _execute_llm_turn(
+        self,
+        active_context: List[Dict[str, Any]],
+        tools_schema: Optional[List[Dict[str, Any]]],
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> Any:
+        """Executes one LLM inference step, streaming tokens when on_token is active (L1)."""
+        effective_on_token = on_token or self.on_token
+        use_stream = effective_on_token is not None or getattr(self, "enable_streaming", False)
+
+        if use_stream:
+            stream = self.llm.chat_stream(
+                messages=active_context,
+                tools=tools_schema if tools_schema else None,
+            )
+            content_chunks: List[str] = []
+            tool_calls_dict: Dict[int, Dict[str, Any]] = {}
+            reasoning_chunks: List[str] = []
+
+            for chunk in stream:
+                if not getattr(chunk, "choices", None):
+                    continue
+                delta = chunk.choices[0].delta
+
+                # Reasoning tokens
+                reasoning = getattr(delta, "reasoning", None) or getattr(delta, "thinking", None)
+                if reasoning and isinstance(reasoning, str):
+                    reasoning_chunks.append(reasoning)
+                    if self.on_thought:
+                        self.on_thought(reasoning)
+
+                # Content tokens
+                content_chunk = getattr(delta, "content", None)
+                if content_chunk and isinstance(content_chunk, str):
+                    content_chunks.append(content_chunk)
+                    if effective_on_token:
+                        effective_on_token(content_chunk)
+
+                # Tool call tokens
+                tcs = getattr(delta, "tool_calls", None)
+                if tcs:
+                    for tc in tcs:
+                        idx = getattr(tc, "index", 0)
+                        if idx not in tool_calls_dict:
+                            tool_calls_dict[idx] = {
+                                "id": getattr(tc, "id", None) or f"call_{uuid.uuid4().hex[:8]}",
+                                "name": "",
+                                "arguments": [],
+                            }
+                        if getattr(tc, "id", None) and isinstance(tc.id, str):
+                            tool_calls_dict[idx]["id"] = tc.id
+                        if getattr(tc, "function", None):
+                            fn = tc.function
+                            if getattr(fn, "name", None) and isinstance(fn.name, str):
+                                tool_calls_dict[idx]["name"] += fn.name
+                            if getattr(fn, "arguments", None) and isinstance(fn.arguments, str):
+                                tool_calls_dict[idx]["arguments"].append(fn.arguments)
+
+            content = "".join(content_chunks) if content_chunks else None
+            assembled_tool_calls = []
+            for idx in sorted(tool_calls_dict.keys()):
+                entry = tool_calls_dict[idx]
+                assembled_tool_calls.append(
+                    SimpleNamespace(
+                        id=entry["id"],
+                        type="function",
+                        function=SimpleNamespace(
+                            name=entry["name"],
+                            arguments="".join(entry["arguments"]),
+                        ),
+                    )
+                )
+
+            return SimpleNamespace(
+                role="assistant",
+                content=content,
+                tool_calls=assembled_tool_calls if assembled_tool_calls else None,
+                reasoning="".join(reasoning_chunks) if reasoning_chunks else None,
+            )
+        else:
+            response = self.llm.chat(
+                messages=active_context,
+                tools=tools_schema if tools_schema else None,
+            )
+            return response.choices[0].message
+
+    def _classify_request_intent(self, user_input: str) -> Dict[str, Any]:
+        """Semantically classifies incoming user intent using the local Qwen3 model (self.llm).
+
+        Distinguishes between new_task, continuation, observational, general, and cancel.
+        Resolves context-dependent references, handles compound requests, and eliminates
+        all hardcoded phrase and starter lists.
+        """
+        raw_text = user_input.strip() if user_input else ""
+        lower = raw_text.lower()
+
+        # 1. Input validation: Empty inputs default to general
+        if not raw_text:
+            return {
+                "type": "general",
+                "is_followup": False,
+                "is_observational": False,
+                "is_new_action": False,
+                "resolved_action": "",
+                "reasoning": "Empty user input",
+            }
+
+        # 2. Safety-critical emergency controls (stop, cancel, reset, abort)
+        if lower in ("stop", "cancel", "reset", "clear goal", "abort"):
+            return {
+                "type": "cancel",
+                "is_followup": False,
+                "is_observational": False,
+                "is_new_action": False,
+                "resolved_action": "cancel",
+                "reasoning": "Safety-critical emergency stop command",
+            }
+
+        # 3. Assemble lightweight agent context for semantic classification
+        active_goal = self.active_goal
+        last_goal = getattr(self, "last_completed_goal", None)
+
+        if self.failed_operations:
+            status = f"Failed operations: {', '.join(f.get('tool', 'unknown') + ': ' + str(f.get('error', '')) for f in self.failed_operations[-2:])}"
+        elif active_goal:
+            status = f"In progress (active goal: {active_goal})"
+        elif last_goal:
+            status = f"Completed previous goal: {last_goal}"
+        else:
+            status = "Ready / Idle"
+
+        history_lines = []
+        for msg in self.messages[-6:]:
+            role = msg.get("role")
+            if role in ("user", "assistant"):
+                content = msg.get("content") or ""
+                if len(content) > 120:
+                    content = content[:120] + "..."
+                history_lines.append(f"{role.capitalize()}: {content}")
+        recent_history = "\n".join(history_lines) if history_lines else "None"
+
+        user_prompt = (
+            f"Context:\n"
+            f"- Active Goal: {active_goal or 'None'}\n"
+            f"- Previous Completed Goal: {last_goal or 'None'}\n"
+            f"- Execution Status: {status}\n"
+            f"- Recent Conversation History:\n{recent_history}\n\n"
+            f"User Request: \"{raw_text}\"\n"
+            f"Classify the intent into JSON:"
+        )
+
+        messages = [
+            {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # 4. Invoke existing local Qwen3 model via self.llm
+        intent_t0 = time.perf_counter()
+        ALLOWED_INTENTS = {"new_task", "continuation", "observational", "general", "cancel"}
+        try:
+            # Check if self.llm has classify_intent method
+            if hasattr(self.llm, "classify_intent") and callable(self.llm.classify_intent):
+                response = self.llm.classify_intent(messages, temperature=0.0)
+            else:
+                response = self.llm.chat(messages=messages, tools=None, temperature=0.0)
+
+            # Extract message content
+            content = None
+            if hasattr(response, "choices") and response.choices:
+                msg_obj = response.choices[0].message
+                content = getattr(msg_obj, "content", None)
+            elif isinstance(response, dict):
+                content = response.get("content")
+
+            if not isinstance(content, str):
+                raise ValueError("LLM response did not contain string content")
+
+            # Strip thinking tags from Qwen3
+            clean = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+            # Parse JSON
+            json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", clean, flags=re.DOTALL)
+            if not json_match:
+                json_match = re.search(r"\{.*\}", clean, flags=re.DOTALL)
+
+            if not json_match:
+                raise ValueError(f"No JSON object found in output: {clean[:100]}")
+
+            parsed = json.loads(json_match.group(1 if json_match.lastindex else 0))
+            intent = parsed.get("intent", "").lower().strip()
+            resolved = parsed.get("resolved_action", "").strip() or raw_text
+            reasoning = parsed.get("reasoning", "").strip()
+
+            if intent not in ALLOWED_INTENTS:
+                raise ValueError(f"Unknown intent: {intent}")
+
+            intent_dur = time.perf_counter() - intent_t0
+            self.last_turn_metrics["intent_classification_duration_s"] = round(intent_dur, 4)
+
+            return {
+                "type": intent,
+                "is_followup": (intent == "continuation"),
+                "is_observational": (intent == "observational"),
+                "is_new_action": (intent == "new_task"),
+                "resolved_action": resolved,
+                "reasoning": reasoning,
+            }
+
+        except Exception as e:
+            intent_dur = time.perf_counter() - intent_t0
+            self.last_turn_metrics["intent_classification_duration_s"] = round(intent_dur, 4)
+            # Safe fallback handling for unparseable output or mock environments
+            is_obs = ("screen" in lower) and any(w in lower for w in ("see", "inspect", "describe", "look", "read", "what", "show")) and not any(w in lower for w in ("click", "type", "press", "open", "launch", "submit", "run", "close", "delete"))
+            if is_obs:
+                fallback_type = "observational"
+            elif active_goal:
+                fallback_type = "continuation"
+            else:
+                fallback_type = "new_task"
+
+            return {
+                "type": fallback_type,
+                "is_followup": (fallback_type == "continuation"),
+                "is_observational": (fallback_type == "observational"),
+                "is_new_action": (fallback_type == "new_task"),
+                "resolved_action": raw_text,
+                "reasoning": f"Safe fallback due to classification error or mock environment: {e}",
+            }
+
+    def step(self, user_input: str, on_token: Optional[Callable[[str], None]] = None) -> str:
+        """Processes a user input through the autonomous ReAct cycle with latency tracking and streaming (L1, A4)."""
         start_time = time.perf_counter()
         lower_input = user_input.strip().lower()
 
+        # Reset per-turn performance telemetry (A4)
+        self.last_turn_metrics = {
+            "planning_duration_s": 0.0,
+            "intent_classification_duration_s": 0.0,
+            "model_prep_duration_s": 0.0,
+            "llm_requests": [],
+            "tool_executions": [],
+            "total_duration_s": 0.0,
+            "iterations": 0,
+            "streamed": bool(on_token or self.on_token or getattr(self, "enable_streaming", False)),
+        }
+
+        # A2: Ultra-fast reflex route for deterministic commands (<15ms)
+        # Safe, independent commands (volume, time, mute, telemetry) execute immediately even if a goal is active!
+        if self.enable_fast_path:
+            fast_reply = self.fast_path.route(user_input)
+            if fast_reply is not None:
+                # Goal-dependent continuation directives stay on the reasoning path
+                goal_continuation_keywords = ["continue", "submit", "try again", "already open", "keep going"]
+                if not (self.active_goal and any(k in lower_input for k in goal_continuation_keywords)):
+                    timed_reply = self._append_timing(fast_reply, start_time)
+                    self.messages.append({"role": "user", "content": user_input})
+                    self.messages.append({"role": "assistant", "content": timed_reply})
+                    self.last_turn_metrics["total_duration_s"] = round(time.perf_counter() - start_time, 4)
+                    return timed_reply
+
+        # Determine task relation: new task vs. continuation vs. observational query
+        intent_info = self._classify_request_intent(user_input)
+
         # Check for explicit goal cancellation or reset
-        if lower_input in ("stop", "cancel", "reset", "clear goal", "abort"):
+        if intent_info["type"] == "cancel":
             self.active_goal = None
+            self.last_completed_goal = None
+            self.failed_operations.clear()
             self.messages.append({"role": "user", "content": user_input})
             reply = "Understood, Sir. I have cleared the active goal."
             self.messages.append({"role": "assistant", "content": reply})
+            self.last_turn_metrics["total_duration_s"] = round(time.perf_counter() - start_time, 4)
             return self._append_timing(reply, start_time)
 
-        # Detect if this input is a correction or continuation of an active goal
-        is_followup_or_correction = False
-        if self.active_goal:
-            followup_indicators = [
-                "already open", "opened one", "in the browser", "see the screen",
-                "look at", "navigate", "clicking", "continue", "submit", "try",
-                "man", "please", "yes", "no", "why", "do it", "focus", "click",
-            ]
-            if any(ind in lower_input for ind in followup_indicators) or len(user_input.split()) <= 8:
-                is_followup_or_correction = True
+        is_observational_query = intent_info["is_observational"]
+        is_followup_or_correction = intent_info["is_followup"]
 
-        if not is_followup_or_correction:
-            action_indicators = [
-                "do ", "solve ", "complete ", "navigate ", "open ", "find ", "click ",
-                "type ", "write ", "run ", "test ", "submit ", "fix ", "check ",
-            ]
-            if any(lower_input.startswith(ind) or ind in lower_input for ind in action_indicators):
-                self.active_goal = user_input.strip()
+        if is_observational_query:
+            # Observational queries are self-contained and clear lingering active action goals
+            self.active_goal = None
+        elif intent_info["is_new_action"]:
+            # Fresh action task: start a new goal
+            self.active_goal = user_input.strip()
 
-        # Ultra-fast reflex route for common system tasks (<15ms)
-        # Bypassed if an active goal is underway so perception/control is handled by the agent
-        if self.enable_fast_path and not self.active_goal:
-            fast_reply = self.fast_path.route(user_input)
-            if fast_reply is not None:
-                timed_reply = self._append_timing(fast_reply, start_time)
-                self.messages.append({"role": "user", "content": user_input})
-                self.messages.append({"role": "assistant", "content": timed_reply})
-                return timed_reply
-
-        # Build prompt payload preserving active goal context
-        if is_followup_or_correction and self.active_goal:
+        # Build prompt payload preserving active goal context and resolved action
+        target_active_goal = self.active_goal or getattr(self, "last_completed_goal", None)
+        if is_followup_or_correction and target_active_goal:
+            self.active_goal = target_active_goal
+            resolved_directive = intent_info.get("resolved_action") or user_input
             effective_user_content = (
                 f"[CURRENT ACTIVE OBJECTIVE]: {self.active_goal}\n"
-                f"[USER CORRECTION / DIRECTION]: {user_input}\n\n"
+                f"[USER CORRECTION / DIRECTION]: {user_input}\n"
+                f"[RESOLVED ACTION]: {resolved_directive}\n\n"
                 f"DIRECTIVE: Continue executing towards the ACTIVE OBJECTIVE above using the user's latest correction/guidance. "
                 f"Do NOT reset, do NOT ask what task is meant, and do NOT claim you lack capabilities. "
                 f"Execute the next required desktop tool action."
@@ -397,12 +692,14 @@ class JarvisAgent:
         # Contextualize vision grounding and screen inspection with current user request
         grounding_engine.set_current_user_prompt(user_input)
 
-        # Display planned execution workflow upfront
+        # A1: Deterministic workflow plan upfront without extra LLM round-trip
+        plan_t0 = time.perf_counter()
         workflow_plan = self.generate_workflow_plan(user_input)
+        self.last_turn_metrics["planning_duration_s"] = round(time.perf_counter() - plan_t0, 4)
         if self.on_workflow_plan:
             self.on_workflow_plan(workflow_plan)
 
-        # Refresh system prompt with latest memory context & relevant recalled facts
+        # Refresh system prompt with cached memory context (A5)
         self.messages[0]["content"] = self._build_system_prompt(user_input)
         self.messages.append({"role": "user", "content": effective_user_content})
 
@@ -413,6 +710,9 @@ class JarvisAgent:
 
         tools_schema = self.registry.get_schemas()
         iterations = 0
+
+        # Action requests detected semantically (new_task or continuation)
+        has_action_request = intent_info["type"] in ("new_task", "continuation")
 
         # State tracking to prevent redundant / duplicate tool executions
         perception_cache: Dict[str, ToolResult] = {}
@@ -433,26 +733,28 @@ class JarvisAgent:
 
         while iterations < self.max_iterations:
             iterations += 1
+            self.last_turn_metrics["iterations"] = iterations
 
-            # Prune context to avoid TPM limit blowouts
+            # Prune context to avoid memory bloat (A5)
             active_context = self._prune_context()
 
             try:
-                response = self.llm.chat(
-                    messages=active_context,
-                    tools=tools_schema if tools_schema else None,
-                )
+                message = self._execute_llm_turn(active_context, tools_schema, on_token=on_token)
             except Exception as e:
                 err_msg = f"Neural processing error: {e}"
                 if self.on_thought:
                     self.on_thought(err_msg)
+                self.last_turn_metrics["total_duration_s"] = round(time.perf_counter() - start_time, 4)
                 return self._append_timing(
                     f"I encountered an error communicating with my cognitive backend: {e}",
                     start_time,
                 )
 
-            choice = response.choices[0]
-            message = choice.message
+            # Record per-request LLM latency metrics (A4)
+            llm_metrics = dict(getattr(self.llm, "last_metrics", {}))
+            self.last_turn_metrics["llm_requests"].append(llm_metrics)
+            prep_metrics = getattr(model_manager, "last_switch_metrics", {})
+            self.last_turn_metrics["model_prep_duration_s"] += prep_metrics.get("duration_s", 0.0)
 
             # If the model produced reasoning tokens (e.g. Qwen3 thinking), surface to thought callback
             reasoning = getattr(message, "reasoning", None) or getattr(message, "thinking", None)
@@ -486,8 +788,24 @@ class JarvisAgent:
                             for tc in tool_calls
                         ],
                     })
-                else:
+                elif hasattr(message, "model_dump"):
                     self.messages.append(message.model_dump(exclude_none=True))
+                else:
+                    self.messages.append({
+                        "role": "assistant",
+                        "content": getattr(message, "content", None),
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments if isinstance(tc.function.arguments, str) else json.dumps(tc.function.arguments),
+                                },
+                            }
+                            for tc in tool_calls
+                        ],
+                    })
 
                 abort_subsequent = False
                 for tool_call in tool_calls:
@@ -496,7 +814,6 @@ class JarvisAgent:
 
                     if abort_subsequent:
                         # If a previous tool in this batch failed, skip execution
-                        # and append a dummy error result to satisfy LLM API requirements.
                         self.messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -580,7 +897,22 @@ class JarvisAgent:
                                 perception_cache[fn_name] = result
                                 screen_modified_since_perception = False
 
+                            # Terminal gate for observational queries: close tool gate so LLM synthesizes final text (A3)
+                            if fn_name in perception_tools and result.success and is_observational_query and not has_action_request:
+                                tools_schema = None
+
+                            # Terminal gate when speak_message is executed
+                            if fn_name == "speak_message" and result.success:
+                                tools_schema = None
+
                     last_tool_signature = tool_sig
+
+                    # Record per-tool latency telemetry (A4)
+                    self.last_turn_metrics["tool_executions"].append({
+                        "tool": fn_name,
+                        "duration_s": round(duration, 4),
+                        "success": result.success,
+                    })
 
                     if not result.success:
                         self.failed_operations.append({
@@ -596,7 +928,7 @@ class JarvisAgent:
                         except TypeError:
                             self.on_tool_result(fn_name, result.output if result.success else result.error, result.success)
 
-                    # Preserve rich perception outputs (inspect_screen, DOM, windows) while guarding against massive outputs
+                    # Preserve rich perception outputs while guarding against token overflow (A5)
                     clean_content = result.to_message_content()
                     if cached_perception_hit:
                         clean_content = (
@@ -608,7 +940,18 @@ class JarvisAgent:
                             f"to make progress on your active objective."
                         )
 
-                    max_chars = 3500 if fn_name in ("inspect_screen", "scan_webpage_dom", "list_open_windows", "read_file") else 2500
+                    if fn_name == "inspect_screen":
+                        if is_observational_query or any(w in user_input.lower() for w in ["what do you see", "read the screen", "see the screen", "describe the screen", "what's on my screen", "what is on my screen", "tell me what you see"]):
+                            clean_content += f"\n\nDIRECTIVE FOR JARVIS: Report what you observe directly to {settings.USER_TITLE} in your first-person Jarvis persona. Your observational objective is complete."
+                        else:
+                            clean_content += (
+                                f"\n\nDIRECTIVE FOR JARVIS: Now that you have observed the screen, proceed immediately with the next action "
+                                f"required for {settings.USER_TITLE}'s goal: '{user_input}'. "
+                                f"Focus the target application window using focus_window, click using click_element, or type using type_text_input. "
+                                f"Do NOT stop at observation or repeat inspect_screen."
+                            )
+
+                    max_chars = 2500
                     if len(clean_content) > max_chars:
                         clean_content = clean_content[:max_chars] + "... [truncated to prevent token overflow]"
 
@@ -623,22 +966,62 @@ class JarvisAgent:
                 # Loop continues so the LLM can inspect tool outputs
                 continue
 
-            # No tool calls: final answer produced
+            # No tool calls: final answer produced (A3: Stop when goal is satisfied)
             content = message.content or ""
+
+            # Guard against local 4B/8B model meta-evaluator leakage (e.g. "No function call required")
+            lower_c = content.lower().strip()
+            meta_evaluator_phrases = [
+                "no function call required",
+                "no function call needed",
+                "no further function calls are needed",
+                "no further tool calls are needed",
+                "no tool call needed",
+                "has already retrieved the screen description",
+                "the assistant has already retrieved",
+            ]
+            if any(phrase in lower_c for phrase in meta_evaluator_phrases):
+                if is_observational_query or not has_action_request:
+                    last_tool_msg = next((m for m in reversed(self.messages) if m.get("role") == "tool" and m.get("name") in ("inspect_screen", "take_screenshot")), None)
+                    if last_tool_msg and last_tool_msg.get("content"):
+                        desc = last_tool_msg["content"]
+                        desc_chunk = desc.split("\n\nDIRECTIVE")[0].strip()
+                        try:
+                            parsed = json.loads(desc_chunk)
+                            if isinstance(parsed, dict) and "description" in parsed:
+                                desc = parsed["description"]
+                        except Exception:
+                            pass
+                        content = f"Sir, on your screen I observe the following:\n\n{desc}"
+                else:
+                    content = re.sub(
+                        r"(?i)(?:the assistant (?:has )?)?(?:already retrieved [^.\n]*[.\n]?|no (?:further )?(?:function|tool) call[s]? (?:are |is )?(?:required|needed)[^.\n]*[.\n]?)",
+                        "",
+                        content,
+                    ).strip()
+
             timed_reply = self._append_timing(content, start_time)
             self.messages.append({"role": "assistant", "content": content})
+            self.last_turn_metrics["total_duration_s"] = round(time.perf_counter() - start_time, 4)
+
+            # Observational queries are self-contained and clear active goal; completed goals record last_completed_goal
+            if is_observational_query:
+                self.active_goal = None
+            elif self.active_goal:
+                self.last_completed_goal = self.active_goal
+
             try:
-                from core.model_manager import model_manager
-                model_manager.unload_on_idle()
+                model_manager.unload_on_idle(force=False)
             except Exception:
                 pass
             return timed_reply
 
         try:
-            from core.model_manager import model_manager
-            model_manager.unload_on_idle()
+            model_manager.unload_on_idle(force=False)
         except Exception:
             pass
+
+        self.last_turn_metrics["total_duration_s"] = round(time.perf_counter() - start_time, 4)
 
         if self.failed_operations:
             failure_lines = "\n".join([f"- **{f['tool']}**: {f['error']}" for f in self.failed_operations[-3:]])

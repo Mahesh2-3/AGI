@@ -1,21 +1,18 @@
 import logging
-import os
+import time
 from typing import Any, Callable, Dict, Generator, List, Optional
 from config.settings import settings
 from core.model_manager import model_manager
 
 logger = logging.getLogger("JARVIS.LLM")
 
-# Groq free-tier model cascade hierarchy for zero downtime / rate-limit resilience
-GROQ_CASCADE_MODELS = [
-    "openai/gpt-oss-20b",
-    "qwen/qwen3.8-27b",
-    "openai/gpt-oss-120b",
-]
-
 
 class LLMClient:
-    """Manages connections to model providers (default: local Ollama qwen3:4b running on GPU)."""
+    """High-speed local inference client interfacing directly with local Ollama GPU models.
+
+    Includes per-request latency tracking, Time-To-First-Token (TTFT) instrumentation,
+    streaming integration, and coordinated VRAM residency.
+    """
 
     def __init__(
         self,
@@ -24,122 +21,32 @@ class LLMClient:
         on_fallback: Optional[Callable[[str, str, str], None]] = None,
     ):
         self.provider = (provider or getattr(settings, "DEFAULT_PROVIDER", "ollama")).lower()
-        self.model = model or getattr(settings, "DEFAULT_MODEL", "qwen3:4b")
+        self.model = model or getattr(settings, "DEFAULT_MODEL", "qwen3:8b")
         self.ollama_base_url = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
+        self.keep_alive = getattr(settings, "OLLAMA_KEEP_ALIVE", "5m")
         self.on_fallback = on_fallback
         self._client = None
-        self._groq_keys: List[str] = []
-        self._groq_clients: Dict[str, Any] = {}
-        self._key_cooldowns: Dict[str, float] = {}
-        self._current_key_idx: int = 0
+
+        # Metrics for the last inference request
+        self.last_metrics: Dict[str, Any] = {
+            "model": self.model,
+            "duration_s": 0.0,
+            "ttft_s": None,
+            "token_count": 0,
+            "streamed": False,
+        }
+
         self._init_client()
 
-        # Cooldown tracker: model_name -> expiry timestamp
-        self._model_cooldowns: Dict[str, float] = {}
-        self._last_fallback_alert: Dict[str, float] = {}
-
-        if self.provider == "groq":
-            self.model_cascade = [self.model] + [m for m in GROQ_CASCADE_MODELS if m != self.model]
-        else:
-            self.model_cascade = [self.model]
-
-    def _get_active_cascade(self) -> List[str]:
-        """Returns candidate models with cooled-down models prioritized."""
-        import time
-        now = time.time()
-        ready = []
-        cooling = []
-        for m in self.model_cascade:
-            cooldown_until = self._model_cooldowns.get(m, 0.0)
-            if now >= cooldown_until:
-                ready.append(m)
-            else:
-                cooling.append(m)
-        # Try ready models first, then cooling models as backup
-        return ready if ready else cooling
-
     def _init_client(self):
-        if self.provider == "ollama":
-            from openai import OpenAI
-            base_url = f"{self.ollama_base_url.rstrip('/')}/v1"
-            self._client = OpenAI(base_url=base_url, api_key="ollama")
-        elif self.provider == "groq":
-            self._groq_keys = list(settings.GROQ_API_KEYS)
-            if not self._groq_keys:
-                single = settings.GROQ_API_KEY or os.environ.get("GROQ_API_KEY")
-                if single:
-                    self._groq_keys = [single.strip()]
-            if self._groq_keys:
-                from groq import Groq
-                for k in self._groq_keys:
-                    self._groq_clients[k] = Groq(api_key=k)
-                self._client = self._groq_clients[self._groq_keys[0]]
-            else:
-                self._client = None
-        elif self.provider == "openai":
-            api_key = settings.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY")
-            if api_key:
-                from openai import OpenAI
-                self._client = OpenAI(api_key=api_key)
-            else:
-                self._client = None
-        else:
-            from openai import OpenAI
-            base_url = f"{self.ollama_base_url.rstrip('/')}/v1"
-            self._client = OpenAI(base_url=base_url, api_key="ollama")
-
-    def _get_candidate_clients(self) -> List[tuple[str, Any]]:
-        """Returns active clients prioritized by cooldown status with round-robin load distribution."""
-        import time
-
-        if self.provider == "ollama":
-            return [("ollama", self._client)] if self._client else []
-
-        # If _client was overridden by a test mock or custom object
-        if self._client and (not self._groq_keys or self._client not in self._groq_clients.values()):
-            return [("default", self._client)]
-
-        if self.provider != "groq" or not self._groq_keys:
-            return [("default", self._client)] if self._client else []
-
-        now = time.time()
-        ready = []
-        cooling = []
-
-        n = len(self._groq_keys)
-        ordered_keys = [self._groq_keys[(self._current_key_idx + i) % n] for i in range(n)]
-
-        for k in ordered_keys:
-            client = self._groq_clients.get(k)
-            if not client:
-                continue
-            cd = self._key_cooldowns.get(k, 0.0)
-            if now >= cd:
-                ready.append((k, client))
-            else:
-                cooling.append((k, client))
-
-        # Advance round-robin index
-        self._current_key_idx = (self._current_key_idx + 1) % max(1, n)
-        return ready if ready else cooling
+        """Initializes the OpenAI-compatible client for local Ollama."""
+        from openai import OpenAI
+        base_url = f"{self.ollama_base_url.rstrip('/')}/v1"
+        self._client = OpenAI(base_url=base_url, api_key="ollama")
 
     @property
     def is_configured(self) -> bool:
-        return self._client is not None or len(self._groq_clients) > 0
-
-    @property
-    def active_key_count(self) -> int:
-        return len(self._groq_keys) if self.provider == "groq" else (1 if self.is_configured else 0)
-
-    def _is_rate_limit_error(self, err: Exception) -> bool:
-        """Determines if the exception is due to rate limits or quota."""
-        err_str = str(err).lower()
-        if "rate_limit" in err_str or "rate limit" in err_str or "429" in err_str:
-            return True
-        status_code = getattr(err, "status_code", None)
-        if status_code == 429:
-            return True
-        return False
+        return self._client is not None
 
     def chat(
         self,
@@ -147,99 +54,57 @@ class LLMClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: float = 0.5,
     ) -> Any:
-        """Sends chat request to the LLM backend with multi-key failover and model cascading."""
-        clients = self._get_candidate_clients()
-        if not clients:
-            if self.provider == "ollama":
-                raise RuntimeError(
-                    f"Local Ollama client not configured. Ensure Ollama is running at {self.ollama_base_url}."
-                )
+        """Sends chat request to local Ollama with full latency measurement and residency management."""
+        if not self._client:
             raise RuntimeError(
-                f"No API key found for provider '{self.provider}'. "
-                "Please configure GROQ_API_KEY (or multiple GROQ_API_KEYS) in your .env file."
+                f"Local Ollama client not configured. Ensure Ollama is running at {self.ollama_base_url}."
             )
 
-        last_exception = None
-        import time
-        cascade = self._get_active_cascade()
+        # Coordinate VRAM residency before inference
+        model_manager.prepare_for_model(self.model)
 
-        for idx, candidate_model in enumerate(cascade):
-            for key_idx, (key_id, client) in enumerate(clients):
-                kwargs: Dict[str, Any] = {
-                    "model": candidate_model,
-                    "messages": messages,
-                    "temperature": temperature,
-                }
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "extra_body": {"keep_alive": self.keep_alive},
+        }
 
-                if tools and len(tools) > 0:
-                    kwargs["tools"] = tools
-                    kwargs["tool_choice"] = "auto"
+        if tools and len(tools) > 0:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
 
-                if self.provider == "ollama":
-                    model_manager.prepare_for_model(candidate_model)
-                    kwargs["extra_body"] = {"keep_alive": "2m"}
+        start_time = time.perf_counter()
+        try:
+            response = self._client.chat.completions.create(**kwargs)
+            duration = time.perf_counter() - start_time
+            model_manager.mark_active()
 
-                try:
-                    response = client.chat.completions.create(**kwargs)
-                    return response
-                except Exception as e:
-                    last_exception = e
-                    err_lower = str(e).lower()
-                    is_rate_limit = self._is_rate_limit_error(e)
+            token_count = 0
+            if hasattr(response, "usage") and response.usage:
+                token_count = getattr(response.usage, "completion_tokens", 0)
 
-                    # Multi-key rotation on rate limit before degrading model
-                    if is_rate_limit and len(clients) > 1:
-                        self._key_cooldowns[key_id] = time.time() + 60.0
-                        logger.warning(
-                            f"Groq key {key_id[:8]}... rate-limited on {candidate_model}. "
-                            f"{len(clients) - 1 - key_idx} keys remaining in pool."
-                        )
-                        if key_idx < len(clients) - 1:
-                            next_key_id = clients[key_idx + 1][0]
-                            if self.on_fallback:
-                                self.on_fallback(
-                                    f"Key {key_id[:8]}...",
-                                    f"Key {next_key_id[:8]}...",
-                                    f"Rate limit on {candidate_model}; rotating to alternate Groq key",
-                                )
-                            continue
+            self.last_metrics = {
+                "model": self.model,
+                "duration_s": round(duration, 4),
+                "ttft_s": None,
+                "token_count": token_count,
+                "streamed": False,
+            }
+            logger.debug(f"Inference completed on {self.model} in {duration:.3f}s ({token_count} tokens).")
+            return response
+        except Exception as e:
+            duration = time.perf_counter() - start_time
+            logger.error(f"Inference failed on {self.model} after {duration:.3f}s: {e}")
+            raise e
 
-                    is_recoverable = (
-                        is_rate_limit
-                        or "tool_use_failed" in err_lower
-                        or "tool choice is none" in err_lower
-                        or "failed_generation" in err_lower
-                        or "output_parse_failed" in err_lower
-                        or "503" in err_lower
-                        or "500" in err_lower
-                    )
-                    if is_recoverable and idx < len(cascade) - 1:
-                        now_ts = time.time()
-                        self._model_cooldowns[candidate_model] = now_ts + 120.0
-                        next_model = cascade[idx + 1]
-
-                        # Deduplicate alerts within 15 seconds
-                        pair_key = f"{candidate_model}->{next_model}"
-                        if now_ts - self._last_fallback_alert.get(pair_key, 0.0) > 15.0:
-                            self._last_fallback_alert[pair_key] = now_ts
-                            logger.warning(
-                                f"Model issue on {candidate_model} ({e}). Cascading failover to {next_model}."
-                            )
-                            if self.on_fallback:
-                                self.on_fallback(candidate_model, next_model, str(e))
-
-                        # Pause briefly for token bucket recovery
-                        import re
-                        retry_match = re.search(r"try again in ([\d\.]+)s", str(e), re.IGNORECASE)
-                        wait_s = float(retry_match.group(1)) if retry_match else 1.2
-                        time.sleep(min(2.5, wait_s))
-                        break  # Break out of key loop to cascade to next candidate model
-
-                    # If not recoverable or exhausted all models, raise
-                    raise e
-
-        if last_exception:
-            raise last_exception
+    def classify_intent(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.0,
+    ) -> Any:
+        """Semantically classifies user intent using local Qwen3 without tool calls."""
+        return self.chat(messages=messages, tools=None, temperature=temperature)
 
     def chat_stream(
         self,
@@ -247,59 +112,53 @@ class LLMClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: float = 0.5,
     ) -> Generator[Any, None, None]:
-        """Streams chat completion tokens with multi-key failover and model cascading."""
-        clients = self._get_candidate_clients()
-        if not clients:
-            if self.provider == "ollama":
-                raise RuntimeError(
-                    f"Local Ollama client not configured. Ensure Ollama is running at {self.ollama_base_url}."
-                )
+        """Streams chat completion tokens from local Ollama with TTFT measurement."""
+        if not self._client:
             raise RuntimeError(
-                f"No API key found for provider '{self.provider}'. "
-                "Please configure GROQ_API_KEY in your .env file."
+                f"Local Ollama client not configured. Ensure Ollama is running at {self.ollama_base_url}."
             )
 
-        last_exception = None
-        import time
-        cascade = self._get_active_cascade()
+        # Coordinate VRAM residency before inference
+        model_manager.prepare_for_model(self.model)
 
-        for idx, candidate_model in enumerate(cascade):
-            for key_idx, (key_id, client) in enumerate(clients):
-                kwargs: Dict[str, Any] = {
-                    "model": candidate_model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "stream": True,
-                }
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+            "extra_body": {"keep_alive": self.keep_alive},
+        }
 
-                if tools and len(tools) > 0:
-                    kwargs["tools"] = tools
-                    kwargs["tool_choice"] = "auto"
+        if tools and len(tools) > 0:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
 
-                if self.provider == "ollama":
-                    model_manager.prepare_for_model(candidate_model)
-                    kwargs["extra_body"] = {"keep_alive": "2m"}
+        start_time = time.perf_counter()
+        ttft: Optional[float] = None
+        chunks_count = 0
 
-                try:
-                    stream = client.chat.completions.create(**kwargs)
-                    for chunk in stream:
-                        yield chunk
-                    return
-                except Exception as e:
-                    last_exception = e
-                    if self._is_rate_limit_error(e) and len(clients) > 1 and key_idx < len(clients) - 1:
-                        self._key_cooldowns[key_id] = time.time() + 60.0
-                        continue
-                    if self._is_rate_limit_error(e) and idx < len(cascade) - 1:
-                        self._model_cooldowns[candidate_model] = time.time() + 60.0
-                        next_model = cascade[idx + 1]
-                        logger.warning(
-                            f"Rate limit encountered on {candidate_model}. Cascading failover stream to {next_model}."
-                        )
-                        if self.on_fallback:
-                            self.on_fallback(candidate_model, next_model, str(e))
-                        break
-                    raise e
+        try:
+            stream = self._client.chat.completions.create(**kwargs)
+            for chunk in stream:
+                if ttft is None:
+                    ttft = time.perf_counter() - start_time
+                chunks_count += 1
+                yield chunk
 
-        if last_exception:
-            raise last_exception
+            duration = time.perf_counter() - start_time
+            model_manager.mark_active()
+
+            self.last_metrics = {
+                "model": self.model,
+                "duration_s": round(duration, 4),
+                "ttft_s": round(ttft, 4) if ttft is not None else None,
+                "token_count": chunks_count,
+                "streamed": True,
+            }
+            logger.debug(
+                f"Streamed inference on {self.model}: TTFT={ttft:.3f}s, total={duration:.3f}s ({chunks_count} chunks)."
+            )
+        except Exception as e:
+            duration = time.perf_counter() - start_time
+            logger.error(f"Streamed inference failed on {self.model} after {duration:.3f}s: {e}")
+            raise e
