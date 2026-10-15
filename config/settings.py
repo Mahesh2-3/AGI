@@ -67,6 +67,9 @@ class Settings:
     WORKSPACE_DIR: Path = BASE_DIR
     DATA_DIR: Path = BASE_DIR / "data"
     MEMORY_FILE_PATH: Path = Path(os.getenv("JARVIS_MEMORY_PATH", str(BASE_DIR / "data" / "jarvis_memory.json")))
+    DATABASE_PATH: Path = Path(os.getenv("JARVIS_DB_PATH", str(BASE_DIR / "data" / "jarvis.db")))
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "embeddinggemma:300m")
+    EMBEDDING_DIMENSION: int = int(os.getenv("EMBEDDING_DIMENSION", "768"))
 
 
 settings = Settings()

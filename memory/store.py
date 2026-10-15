@@ -1,99 +1,171 @@
-import json
-import os
-import re
-import threading
-import uuid
+"""Persistent, multi-layer memory store for Project J.A.R.V.I.S.
+
+Backed by SQLite with WAL mode, FTS5 full-text indexing, ACID transactions,
+fact supersession, deduplication, and backward-compatible JSON file support.
+"""
+
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import json
+import logging
+import os
 from pathlib import Path
+import re
+import threading
 from typing import Any, Dict, List, Optional, Set
+import uuid
 
 from config.settings import settings
+from memory.db import DatabaseManager, db_manager as default_db_manager
+
+logger = logging.getLogger("JARVIS.MemoryStore")
 
 
 @dataclass
 class MemoryEntry:
+    """Unified record across all five memory layers (working, semantic, episodic, project, procedural)."""
+
     id: str
     content: str
-    category: str = "fact"  # "fact", "preference", "instruction", "profile", "task"
+    category: str = "fact"  # "fact", "preference", "profile", "task", "correction", "event", "procedure"
     tags: List[str] = field(default_factory=list)
     importance: int = 3  # 1 (low) to 5 (critical)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     access_count: int = 0
     last_accessed: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    # Multi-layer architectural attributes
+    layer: str = "semantic"  # "working", "semantic", "episodic", "project", "procedural"
+    subject: Optional[str] = None
+    predicate: Optional[str] = None
+    project_id: Optional[str] = None
+    confidence: float = 1.0
+    status: str = "active"  # "active", "superseded", "expired", "archived"
+    source: str = "user"  # "user", "agent_inference", "tool_output", "verified_fix"
+    provenance: Optional[str] = None
+    expires_at: Optional[str] = None
+    superseded_by: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MemoryEntry":
+        tags_raw = data.get("tags", [])
+        if isinstance(tags_raw, str):
+            try:
+                tags = json.loads(tags_raw)
+            except Exception:
+                tags = [tags_raw]
+        else:
+            tags = list(tags_raw) if tags_raw else []
+
         return cls(
             id=data.get("id", f"mem_{uuid.uuid4().hex[:8]}"),
             content=data.get("content", ""),
             category=data.get("category", "fact"),
-            tags=data.get("tags", []),
+            tags=tags,
             importance=int(data.get("importance", 3)),
             created_at=data.get("created_at", datetime.now(timezone.utc).isoformat()),
             updated_at=data.get("updated_at", datetime.now(timezone.utc).isoformat()),
             access_count=int(data.get("access_count", 0)),
             last_accessed=data.get("last_accessed", datetime.now(timezone.utc).isoformat()),
+            layer=data.get("layer", "semantic"),
+            subject=data.get("subject"),
+            predicate=data.get("predicate"),
+            project_id=data.get("project_id"),
+            confidence=float(data.get("confidence", 1.0)),
+            status=data.get("status", "active"),
+            source=data.get("source", "user"),
+            provenance=data.get("provenance"),
+            expires_at=data.get("expires_at"),
+            superseded_by=data.get("superseded_by"),
         )
 
 
 class MemoryStore:
-    """Persistent, thread-safe memory and profile store for J.A.R.V.I.S.
+    """Production-grade multi-layer memory store for J.A.R.V.I.S.
     
-    Persists across sessions to atomic JSON storage. Supports semantic keyword search,
-    importance weighting, access tracking, user profiling, and prompt context generation.
+    Persists to SQLite with WAL mode and FTS5 full-text search. Maintains an in-memory
+    cache and JSON synchronization when configured with a JSON path for backward compatibility.
     """
 
-    def __init__(self, file_path: Optional[Path | str] = None):
-        self.file_path = Path(file_path) if file_path else settings.MEMORY_FILE_PATH
+    def __init__(
+        self,
+        db_path: Optional[Path | str] = None,
+        file_path: Optional[Path | str] = None,
+    ):
         self._lock = threading.RLock()
+        is_default_db = (db_path is None and file_path is None)
+
+        # Handle backward compatibility: file_path passed by tests or legacy configs
+        if file_path:
+            self.file_path = Path(file_path)
+            # If a JSON path is given, derive a SQLite database alongside it
+            if self.file_path.suffix.lower() == ".json":
+                self.db_path = self.file_path.with_suffix(".db")
+            else:
+                self.db_path = self.file_path
+        elif db_path:
+            self.db_path = Path(db_path)
+            self.file_path = None
+        else:
+            self.db_path = settings.DATABASE_PATH
+            self.file_path = settings.MEMORY_FILE_PATH
+
+        self.db_manager = DatabaseManager(db_path=self.db_path)
         self.memories: Dict[str, MemoryEntry] = {}
         self.profile: Dict[str, Any] = {}
+
+        # Auto-migrate legacy JSON memory if default DB or explicit JSON file path provided
+        if is_default_db and self.file_path and self.file_path.exists():
+            self.db_manager.migrate_from_json_if_needed(self.file_path)
+        elif self.file_path and self.file_path.exists() and self.file_path.suffix.lower() == ".json":
+            self.db_manager.migrate_from_json_if_needed(self.file_path)
+
         self._load()
 
     def _load(self):
+        """Loads memories and profile attributes from SQLite into the in-memory cache."""
         with self._lock:
-            if not self.file_path.exists():
-                return
-
             try:
-                with open(self.file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    self.profile = data.get("profile", {})
-                    raw_entries = data.get("memories", [])
-                    self.memories = {
-                        entry["id"]: MemoryEntry.from_dict(entry)
-                        for entry in raw_entries
-                        if isinstance(entry, dict) and "content" in entry
-                    }
+                with self.db_manager.connection() as conn:
+                    # 1. Load user profile
+                    prof_rows = conn.execute("SELECT key, value FROM user_profile;").fetchall()
+                    self.profile = {r["key"]: r["value"] for r in prof_rows}
+
+                    # 2. Load active memories
+                    mem_rows = conn.execute(
+                        "SELECT * FROM memories WHERE status = 'active' ORDER BY importance DESC, updated_at DESC;"
+                    ).fetchall()
+                    self.memories = {}
+                    for row in mem_rows:
+                        entry = MemoryEntry.from_dict(dict(row))
+                        self.memories[entry.id] = entry
+
+                # If backed by a JSON file path in legacy mode, sync JSON on load
+                self._sync_legacy_json()
             except Exception as e:
-                # Corrupted or unreadable file: keep state clean but do not crash
-                pass
+                logger.error(f"Error loading memories from database: {e}")
 
-    def _save(self):
-        with self._lock:
-            try:
-                parent = self.file_path.parent
-                parent.mkdir(parents=True, exist_ok=True)
-
-                data = {
-                    "version": "1.0",
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "profile": self.profile,
-                    "memories": [entry.to_dict() for entry in self.memories.values()],
-                }
-
-                # Atomic write via temporary file
-                tmp_path = self.file_path.with_suffix(".tmp")
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-                os.replace(tmp_path, self.file_path)
-            except Exception:
-                pass
+    def _sync_legacy_json(self):
+        """Writes cache to legacy JSON file if file_path is configured with a .json extension."""
+        if not self.file_path or self.file_path.suffix.lower() != ".json":
+            return
+        try:
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "version": "1.0",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "profile": self.profile,
+                "memories": [entry.to_dict() for entry in self.memories.values()],
+            }
+            tmp = self.file_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.file_path)
+        except Exception as e:
+            logger.debug(f"Could not sync legacy JSON file: {e}")
 
     def _tokenize(self, text: str) -> Set[str]:
         words = re.findall(r"\b[a-zA-Z0-9_\-\.]+\b", text.lower())
@@ -104,15 +176,37 @@ class MemoryStore:
         }
         return {w for w in words if len(w) > 1 and w not in stop_words}
 
+    def _sanitize_fts_query(self, query: str) -> str:
+        """Converts user natural language search into safe FTS5 query syntax."""
+        tokens = re.findall(r"[a-zA-Z0-9_\.]+", query.lower())
+        valid_tokens = [t for t in tokens if len(t) > 1 and t not in {"and", "or", "not"}]
+        if not valid_tokens:
+            return ""
+        # Match any token with prefix expansion
+        return " OR ".join(f'"{t}"*' for t in valid_tokens)
+
     def remember(
         self,
         content: str,
         category: str = "fact",
         tags: Optional[List[str]] = None,
         importance: int = 3,
+        layer: str = "semantic",
+        subject: Optional[str] = None,
+        predicate: Optional[str] = None,
+        project_id: Optional[str] = None,
+        confidence: float = 1.0,
+        source: str = "user",
+        provenance: Optional[str] = None,
+        expires_at: Optional[str] = None,
     ) -> MemoryEntry:
         """Stores a new fact, preference, or instruction into persistent memory.
-        If an identical or near-duplicate memory exists, updates it cleanly."""
+        
+        Performs deduplication and fact supersession:
+        - If an identical memory exists, updates it cleanly.
+        - If a memory with the same subject and predicate exists with a conflicting value,
+          marks the older memory as superseded.
+        """
         with self._lock:
             clean_content = content.strip()
             if not clean_content:
@@ -127,17 +221,32 @@ class MemoryStore:
             name_match = re.search(r"\b(?:my name is|call me|i am|i'm|user(?:'s)? name is)\s+([a-zA-Z]+)\b", lower)
             if name_match:
                 name = name_match.group(1).capitalize()
-                self.profile["name"] = name
+                self.set_profile_attribute("name", name)
                 category = "profile"
                 importance = 5
+                subject = subject or "user"
+                predicate = predicate or "name"
                 if "name" not in clean_tags:
                     clean_tags.append("name")
 
-            # Check for existing memory match (by exact text or very high token overlap)
+            # Detect key-value preference patterns (e.g. "User preference terminal: kitty")
+            pref_match = re.search(r"\buser preference ([a-zA-Z0-9_]+):\s*(.+)$", lower)
+            if pref_match:
+                p_key = pref_match.group(1).strip()
+                p_val = pref_match.group(2).strip()
+                subject = subject or "user"
+                predicate = predicate or p_key
+                category = "preference"
+
+            new_id = f"mem_{uuid.uuid4().hex[:8]}"
+
+            # 1. Deduplication check: by exact content or high token overlap
             content_tokens = self._tokenize(clean_content)
             existing_match: Optional[MemoryEntry] = None
 
-            for entry in self.memories.values():
+            for entry in list(self.memories.values()):
+                if entry.status != "active":
+                    continue
                 if entry.content.lower() == clean_content.lower():
                     existing_match = entry
                     break
@@ -150,15 +259,45 @@ class MemoryStore:
                         break
 
             if existing_match:
+                # Update existing record
+                merged_tags = list(set(existing_match.tags + clean_tags))
                 existing_match.content = clean_content
                 existing_match.category = category
                 existing_match.importance = max(existing_match.importance, importance)
                 existing_match.updated_at = now
-                existing_match.tags = list(set(existing_match.tags + clean_tags))
-                self._save()
+                existing_match.tags = merged_tags
+                if subject:
+                    existing_match.subject = subject
+                if predicate:
+                    existing_match.predicate = predicate
+                if project_id:
+                    existing_match.project_id = project_id
+
+                with self.db_manager.connection() as conn:
+                    conn.execute(
+                        """
+                        UPDATE memories
+                        SET content = ?, category = ?, tags = ?, importance = ?,
+                            updated_at = ?, subject = coalesce(?, subject),
+                            predicate = coalesce(?, predicate), project_id = coalesce(?, project_id)
+                        WHERE id = ?;
+                        """,
+                        (
+                            clean_content,
+                            category,
+                            json.dumps(merged_tags),
+                            existing_match.importance,
+                            now,
+                            subject,
+                            predicate,
+                            project_id,
+                            existing_match.id,
+                        ),
+                    )
+                self._sync_legacy_json()
                 return existing_match
 
-            new_id = f"mem_{uuid.uuid4().hex[:8]}"
+            # 2. Create and insert fresh record
             entry = MemoryEntry(
                 id=new_id,
                 content=clean_content,
@@ -169,110 +308,280 @@ class MemoryStore:
                 updated_at=now,
                 access_count=0,
                 last_accessed=now,
+                layer=layer,
+                subject=subject,
+                predicate=predicate,
+                project_id=project_id,
+                confidence=confidence,
+                status="active",
+                source=source,
+                provenance=provenance,
+                expires_at=expires_at,
             )
-            self.memories[new_id] = entry
-            self._save()
+
+            with self.db_manager.connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO memories (
+                        id, layer, category, subject, predicate, content, tags,
+                        project_id, importance, confidence, status, source, provenance,
+                        created_at, updated_at, last_accessed, access_count, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        entry.id,
+                        entry.layer,
+                        entry.category,
+                        entry.subject,
+                        entry.predicate,
+                        entry.content,
+                        json.dumps(entry.tags),
+                        entry.project_id,
+                        entry.importance,
+                        entry.confidence,
+                        entry.status,
+                        entry.source,
+                        entry.provenance,
+                        entry.created_at,
+                        entry.updated_at,
+                        entry.last_accessed,
+                        entry.access_count,
+                        entry.expires_at,
+                    ),
+                )
+
+                # 3. Fact Supersession: check if conflicting active record exists for same subject & predicate
+                # Safe to set superseded_by = entry.id now that entry.id is inserted
+                if subject and predicate:
+                    existing_preds = conn.execute(
+                        """
+                        SELECT id, content FROM memories
+                        WHERE subject = ? AND predicate = ? AND status = 'active' AND id != ?;
+                        """,
+                        (subject, predicate, entry.id),
+                    ).fetchall()
+                    for old_row in existing_preds:
+                        if old_row["content"].strip().lower() != clean_content.lower():
+                            conn.execute(
+                                """
+                                UPDATE memories
+                                SET status = 'superseded', superseded_by = ?, updated_at = ?
+                                WHERE id = ?;
+                                """,
+                                (entry.id, now, old_row["id"]),
+                            )
+                            if old_row["id"] in self.memories:
+                                self.memories.pop(old_row["id"], None)
+                            logger.info(f"Superseded older memory '{old_row['id']}' with '{entry.id}'")
+
+            self.memories[entry.id] = entry
+            self._sync_legacy_json()
             return entry
 
     def recall(
         self,
         query: str,
         category: Optional[str] = None,
+        project_id: Optional[str] = None,
+        layer: Optional[str] = None,
         limit: int = 5,
     ) -> List[MemoryEntry]:
-        """Searches long-term memory for entries matching the query."""
+        """Searches persistent memory using SQLite FTS5 with BM25 ranking,
+        falling back gracefully to keyword containment if needed."""
         with self._lock:
-            q_clean = query.strip().lower()
-            if not q_clean:
-                return self.list_all(category=category, limit=limit)
-
-            q_tokens = self._tokenize(q_clean)
-            scored: List[tuple[float, MemoryEntry]] = []
+            q_clean = query.strip()
             now = datetime.now(timezone.utc).isoformat()
+            if not q_clean:
+                return self.list_all(category=category, project_id=project_id, limit=limit)
 
-            for entry in self.memories.values():
-                if category and entry.category.lower() != category.lower():
-                    continue
+            fts_query = self._sanitize_fts_query(q_clean)
+            results: List[MemoryEntry] = []
 
-                score = 0.0
-                entry_lower = entry.content.lower()
+            # 1. Primary: SQLite FTS5 Full-Text Match
+            if fts_query:
+                try:
+                    sql = """
+                        SELECT m.*, bm25(memories_fts) as rank
+                        FROM memories_fts f
+                        JOIN memories m ON f.id = m.id
+                        WHERE memories_fts MATCH ?
+                          AND m.status = 'active'
+                    """
+                    params: List[Any] = [fts_query]
 
-                # Exact phrase match
-                if q_clean in entry_lower:
-                    score += 15.0
+                    if category:
+                        sql += " AND m.category = ?"
+                        params.append(category.lower())
+                    if project_id:
+                        sql += " AND m.project_id = ?"
+                        params.append(project_id)
+                    if layer:
+                        sql += " AND m.layer = ?"
+                        params.append(layer)
 
-                # Token matching
-                entry_tokens = self._tokenize(entry.content)
-                if q_tokens and entry_tokens:
-                    overlap = len(q_tokens & entry_tokens)
-                    score += overlap * 3.0
+                    sql += " ORDER BY rank ASC, m.importance DESC LIMIT ?;"
+                    params.append(limit)
 
-                # Tag matching
-                for tag in entry.tags:
-                    if tag in q_tokens or tag in q_clean:
-                        score += 5.0
+                    with self.db_manager.connection() as conn:
+                        rows = conn.execute(sql, params).fetchall()
+                        for row in rows:
+                            results.append(MemoryEntry.from_dict(dict(row)))
+                except Exception as e:
+                    logger.debug(f"FTS5 query failed, falling back to LIKE: {e}")
 
-                if score > 0:
-                    # Weight by importance (scale 1.0 to 2.0)
-                    score *= (1.0 + (entry.importance - 1) * 0.25)
-                    scored.append((score, entry))
+            # 2. Fallback: Python/SQL token and substring containment if FTS returned nothing
+            if not results:
+                q_lower = q_clean.lower()
+                q_tokens = self._tokenize(q_lower)
+                scored: List[Tuple[float, MemoryEntry]] = []
 
-            scored.sort(key=lambda x: x[0], reverse=True)
-            results = [item[1] for item in scored[:limit]]
+                for entry in self.memories.values():
+                    if entry.status != "active":
+                        continue
+                    if category and entry.category.lower() != category.lower():
+                        continue
+                    if project_id and entry.project_id != project_id:
+                        continue
+                    if layer and entry.layer != layer:
+                        continue
 
-            # Update access statistics
-            for res in results:
-                res.access_count += 1
-                res.last_accessed = now
+                    score = 0.0
+                    entry_lower = entry.content.lower()
 
+                    if q_lower in entry_lower:
+                        score += 15.0
+
+                    entry_tokens = self._tokenize(entry.content)
+                    if q_tokens and entry_tokens:
+                        overlap = len(q_tokens & entry_tokens)
+                        score += overlap * 3.0
+
+                    for tag in entry.tags:
+                        if tag in q_tokens or tag in q_lower:
+                            score += 5.0
+
+                    if score > 0:
+                        score *= (1.0 + (entry.importance - 1) * 0.25)
+                        scored.append((score, entry))
+
+                scored.sort(key=lambda x: x[0], reverse=True)
+                results = [item[1] for item in scored[:limit]]
+
+            # 3. Update access tracking in SQLite & cache
             if results:
-                self._save()
+                with self.db_manager.connection() as conn:
+                    for res in results:
+                        res.access_count += 1
+                        res.last_accessed = now
+                        conn.execute(
+                            "UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?;",
+                            (now, res.id),
+                        )
+                self._sync_legacy_json()
 
             return results
 
     def list_all(
         self,
         category: Optional[str] = None,
+        project_id: Optional[str] = None,
+        layer: Optional[str] = None,
+        status: str = "active",
         limit: int = 50,
     ) -> List[MemoryEntry]:
         """Returns stored memories sorted by importance and update date."""
         with self._lock:
-            items = list(self.memories.values())
+            sql = "SELECT * FROM memories WHERE status = ?"
+            params: List[Any] = [status]
+
             if category:
-                items = [m for m in items if m.category.lower() == category.lower()]
-            items.sort(key=lambda m: (m.importance, m.updated_at), reverse=True)
-            return items[:limit]
+                sql += " AND lower(category) = ?"
+                params.append(category.lower())
+            if project_id:
+                sql += " AND project_id = ?"
+                params.append(project_id)
+            if layer:
+                sql += " AND layer = ?"
+                params.append(layer)
+
+            sql += " ORDER BY importance DESC, updated_at DESC LIMIT ?;"
+            params.append(limit)
+
+            with self.db_manager.connection() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                return [MemoryEntry.from_dict(dict(r)) for r in rows]
 
     def forget(self, query_or_id: str) -> Optional[MemoryEntry]:
-        """Deletes a memory matching ID or content substring."""
+        """Deletes or archives a memory matching ID or content substring."""
         with self._lock:
             target_key = query_or_id.strip()
+            removed: Optional[MemoryEntry] = None
 
-            # Exact ID lookup
+            # 1. Exact ID match
             if target_key in self.memories:
                 removed = self.memories.pop(target_key)
-                self._save()
+            else:
+                # 2. Substring match
+                target_lower = target_key.lower()
+                for k, entry in list(self.memories.items()):
+                    if target_lower in entry.content.lower():
+                        removed = self.memories.pop(k)
+                        break
+
+            if removed:
+                with self.db_manager.connection() as conn:
+                    conn.execute("DELETE FROM memories WHERE id = ?;", (removed.id,))
+                self._sync_legacy_json()
                 return removed
 
-            # Substring match
-            target_lower = target_key.lower()
-            for k, entry in list(self.memories.items()):
-                if target_lower in entry.content.lower():
-                    removed = self.memories.pop(k)
-                    self._save()
-                    return removed
+            # Check database directly if not in memory cache
+            with self.db_manager.connection() as conn:
+                row = conn.execute("SELECT * FROM memories WHERE id = ?;", (target_key,)).fetchone()
+                if not row:
+                    row = conn.execute(
+                        "SELECT * FROM memories WHERE lower(content) LIKE ? ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END LIMIT 1;",
+                        (f"%{target_key.lower()}%",),
+                    ).fetchone()
+
+                if row:
+                    entry = MemoryEntry.from_dict(dict(row))
+                    conn.execute("DELETE FROM memories WHERE id = ?;", (entry.id,))
+                    self.memories.pop(entry.id, None)
+                    self._sync_legacy_json()
+                    return entry
 
             return None
 
-    def set_profile_attribute(self, key: str, value: Any):
-        """Sets a persistent user profile attribute."""
+    def get(self, memory_id: str) -> Optional[MemoryEntry]:
+        """Retrieves a single memory entry by ID from cache or SQLite."""
         with self._lock:
-            self.profile[key] = value
-            self._save()
+            if memory_id in self.memories:
+                return self.memories[memory_id]
+            with self.db_manager.connection() as conn:
+                row = conn.execute("SELECT * FROM memories WHERE id = ?;", (memory_id,)).fetchone()
+                if row:
+                    return MemoryEntry.from_dict(dict(row))
+            return None
+
+    def set_profile_attribute(self, key: str, value: Any):
+        """Sets a persistent user profile attribute in SQLite."""
+        with self._lock:
+            clean_k = str(key).strip().lower().replace(" ", "_")
+            str_val = str(value)
+            now = datetime.now(timezone.utc).isoformat()
+            self.profile[clean_k] = str_val
+
+            with self.db_manager.connection() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO user_profile (key, value, updated_at) VALUES (?, ?, ?);",
+                    (clean_k, str_val, now),
+                )
+            self._sync_legacy_json()
 
     def get_profile_attribute(self, key: str, default: Any = None) -> Any:
         with self._lock:
-            return self.profile.get(key, default)
+            clean_k = str(key).strip().lower().replace(" ", "_")
+            return self.profile.get(clean_k, default)
 
     def get_profile(self) -> Dict[str, Any]:
         with self._lock:
@@ -281,25 +590,36 @@ class MemoryStore:
     def clear(self, category: Optional[str] = None) -> int:
         """Clears memories, optionally scoped to category."""
         with self._lock:
-            if category:
-                to_delete = [k for k, m in self.memories.items() if m.category.lower() == category.lower()]
-                for k in to_delete:
-                    del self.memories[k]
-                self._save()
-                return len(to_delete)
-            else:
-                count = len(self.memories)
-                self.memories.clear()
-                self._save()
-                return count
+            with self.db_manager.connection() as conn:
+                if category:
+                    rows = conn.execute(
+                        "SELECT id FROM memories WHERE lower(category) = ?;",
+                        (category.lower(),),
+                    ).fetchall()
+                    count = len(rows)
+                    conn.execute("DELETE FROM memories WHERE lower(category) = ?;", (category.lower(),))
+                    for r in rows:
+                        self.memories.pop(r["id"], None)
+                else:
+                    count_row = conn.execute("SELECT count(*) as c FROM memories;").fetchone()
+                    count = count_row["c"] if count_row else 0
+                    conn.execute("DELETE FROM memories;")
+                    self.memories.clear()
 
-    def get_context_summary(self, max_items: int = 5) -> str:
-        """Constructs a compact context block of profile and highest-priority memories
+            self._sync_legacy_json()
+            return count
+
+    def get_context_summary(
+        self,
+        max_items: int = 5,
+        project_id: Optional[str] = None,
+    ) -> str:
+        """Constructs a compact, structured context block with safety boundaries
         suitable for direct injection into system prompt context."""
         with self._lock:
             lines = []
 
-            # Profile attributes
+            # 1. Profile attributes
             if self.profile:
                 prof_items = []
                 if "name" in self.profile:
@@ -310,8 +630,15 @@ class MemoryStore:
                 if prof_items:
                     lines.append(f"• User Profile: {', '.join(prof_items)}")
 
-            # Top memories by importance
-            top_memories = self.list_all(limit=max_items)
+            # 2. Active project context (if scoped)
+            if project_id:
+                with self.db_manager.connection() as conn:
+                    p_row = conn.execute("SELECT * FROM projects WHERE id = ?;", (project_id,)).fetchone()
+                    if p_row:
+                        lines.append(f"• Active Project: {p_row['name']} (Stack: {p_row['tech_stack']})")
+
+            # 3. Top semantic memories
+            top_memories = self.list_all(project_id=project_id, limit=max_items)
             if top_memories:
                 lines.append("• Stored Long-Term Memories:")
                 for m in top_memories:
@@ -321,7 +648,12 @@ class MemoryStore:
             if not lines:
                 return ""
 
-            return "[PERSISTENT LONG-TERM MEMORY & USER PROFILE]\n" + "\n".join(lines)
+            return (
+                "[PERSISTENT LONG-TERM MEMORY & USER PROFILE]\n"
+                f"<recalled_context>\n"
+                + "\n".join(lines)
+                + "\n</recalled_context>"
+            )
 
 
 # Global singleton instance
