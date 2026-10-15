@@ -4,6 +4,7 @@ Backed by SQLite with WAL mode, FTS5 full-text indexing, ACID transactions,
 fact supersession, deduplication, and backward-compatible JSON file support.
 """
 
+import concurrent.futures
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
@@ -17,6 +18,7 @@ import uuid
 
 from config.settings import settings
 from memory.db import DatabaseManager, db_manager as default_db_manager
+from memory.embeddings import EmbeddingManager
 
 logger = logging.getLogger("JARVIS.MemoryStore")
 
@@ -114,6 +116,11 @@ class MemoryStore:
             self.file_path = settings.MEMORY_FILE_PATH
 
         self.db_manager = DatabaseManager(db_path=self.db_path)
+        self.embeddings = EmbeddingManager(db_manager=self.db_manager)
+        self._embed_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="jarvis_embed_worker",
+        )
         self.memories: Dict[str, MemoryEntry] = {}
         self.profile: Dict[str, Any] = {}
 
@@ -124,6 +131,19 @@ class MemoryStore:
             self.db_manager.migrate_from_json_if_needed(self.file_path)
 
         self._load()
+
+    def _async_embed_memory(self, memory_id: str, content: str):
+        """Asynchronously computes and persists vector embedding in background."""
+        if hasattr(self, "_embed_executor") and self.embeddings:
+            def _task():
+                try:
+                    vec = self.embeddings.embed_text(content)
+                    if vec:
+                        self.embeddings.store_embedding(memory_id, vec)
+                except Exception as ex:
+                    logger.debug(f"Async embedding failed for memory '{memory_id}': {ex}")
+
+            self._embed_executor.submit(_task)
 
     def _load(self):
         """Loads memories and profile attributes from SQLite into the in-memory cache."""
@@ -295,6 +315,7 @@ class MemoryStore:
                         ),
                     )
                 self._sync_legacy_json()
+                self._async_embed_memory(existing_match.id, existing_match.content)
                 return existing_match
 
             # 2. Create and insert fresh record
@@ -376,6 +397,7 @@ class MemoryStore:
 
             self.memories[entry.id] = entry
             self._sync_legacy_json()
+            self._async_embed_memory(entry.id, entry.content)
             return entry
 
     def recall(
@@ -385,9 +407,10 @@ class MemoryStore:
         project_id: Optional[str] = None,
         layer: Optional[str] = None,
         limit: int = 5,
+        hybrid: bool = False,
     ) -> List[MemoryEntry]:
-        """Searches persistent memory using SQLite FTS5 with BM25 ranking,
-        falling back gracefully to keyword containment if needed."""
+        """Searches persistent memory using fast FTS5 BM25 or hybrid Reciprocal Rank Fusion (FTS5 + Vector),
+        falling back gracefully to token containment if needed."""
         with self._lock:
             q_clean = query.strip()
             now = datetime.now(timezone.utc).isoformat()
@@ -395,7 +418,7 @@ class MemoryStore:
                 return self.list_all(category=category, project_id=project_id, limit=limit)
 
             fts_query = self._sanitize_fts_query(q_clean)
-            results: List[MemoryEntry] = []
+            fts_results: List[MemoryEntry] = []
 
             # 1. Primary: SQLite FTS5 Full-Text Match
             if fts_query:
@@ -420,16 +443,51 @@ class MemoryStore:
                         params.append(layer)
 
                     sql += " ORDER BY rank ASC, m.importance DESC LIMIT ?;"
-                    params.append(limit)
+                    params.append(limit * 2 if hybrid else limit)
 
                     with self.db_manager.connection() as conn:
                         rows = conn.execute(sql, params).fetchall()
                         for row in rows:
-                            results.append(MemoryEntry.from_dict(dict(row)))
+                            fts_results.append(MemoryEntry.from_dict(dict(row)))
                 except Exception as e:
                     logger.debug(f"FTS5 query failed, falling back to LIKE: {e}")
 
-            # 2. Fallback: Python/SQL token and substring containment if FTS returned nothing
+            results: List[MemoryEntry] = []
+
+            # 2. Hybrid Search (RRF): Fuse FTS5 and Semantic Vector Embeddings
+            if hybrid and self.embeddings:
+                try:
+                    query_vec = self.embeddings.embed_text(q_clean)
+                    if query_vec:
+                        vec_matches = self.embeddings.search_similar(
+                            query_vector=query_vec,
+                            top_k=limit * 2,
+                            layer=layer,
+                            category=category,
+                            project_id=project_id,
+                        )
+                        fts_ids = [m.id for m in fts_results]
+                        vec_ids = [m[0] for m in vec_matches]
+
+                        if vec_ids or fts_ids:
+                            fused = self.embeddings.calculate_rrf(fts_ids=fts_ids, vec_ids=vec_ids)
+                            seen_ids = set()
+                            for mem_id, _score in fused:
+                                if mem_id not in seen_ids:
+                                    entry = self.get(mem_id)
+                                    if entry and entry.status == "active":
+                                        results.append(entry)
+                                        seen_ids.add(mem_id)
+                                        if len(results) >= limit:
+                                            break
+                except Exception as ex:
+                    logger.debug(f"Hybrid vector search encountered issue, falling back: {ex}")
+
+            # If hybrid did not yield results (e.g. no vectors or embeddings unavailable), use FTS5 results
+            if not results and fts_results:
+                results = fts_results[:limit]
+
+            # 3. Fallback: Python/SQL token and substring containment if FTS returned nothing
             if not results:
                 q_lower = q_clean.lower()
                 q_tokens = self._tokenize(q_lower)
@@ -480,6 +538,24 @@ class MemoryStore:
                 self._sync_legacy_json()
 
             return results
+
+    def recall_hybrid(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        project_id: Optional[str] = None,
+        layer: Optional[str] = None,
+        limit: int = 5,
+    ) -> List[MemoryEntry]:
+        """Performs hybrid Reciprocal Rank Fusion (FTS5 + Vector) semantic retrieval."""
+        return self.recall(
+            query=query,
+            category=category,
+            project_id=project_id,
+            layer=layer,
+            limit=limit,
+            hybrid=True,
+        )
 
     def list_all(
         self,
