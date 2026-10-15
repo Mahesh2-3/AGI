@@ -609,6 +609,150 @@ class MemoryStore:
             self._sync_legacy_json()
             return count
 
+    def save_procedure(
+        self,
+        title: str,
+        trigger_intent: str,
+        steps: List[str],
+        expected_outcome: str,
+        preconditions: Optional[List[str]] = None,
+        verification_method: Optional[str] = None,
+        failure_modes: Optional[List[str]] = None,
+        confidence: float = 0.8,
+        verified: bool = False,
+    ) -> Dict[str, Any]:
+        """Saves a reusable procedural workflow or fix into the procedures table."""
+        with self._lock:
+            proc_id = f"proc_{uuid.uuid4().hex[:8]}"
+            now = datetime.now(timezone.utc).isoformat()
+            precond_json = json.dumps(preconditions or [])
+            steps_json = json.dumps(steps)
+            fail_json = json.dumps(failure_modes or [])
+
+            # Check if an existing procedure with the same trigger_intent or title exists
+            with self.db_manager.connection() as conn:
+                existing = conn.execute(
+                    "SELECT id FROM procedures WHERE lower(trigger_intent) = ? OR lower(title) = ? LIMIT 1;",
+                    (trigger_intent.strip().lower(), title.strip().lower()),
+                ).fetchone()
+
+                if existing:
+                    proc_id = existing["id"]
+                    conn.execute(
+                        """
+                        UPDATE procedures
+                        SET title = ?, trigger_intent = ?, preconditions = ?, steps = ?,
+                            expected_outcome = ?, verification_method = ?, failure_modes = ?,
+                            confidence = ?, verified = ?, updated_at = ?
+                        WHERE id = ?;
+                        """,
+                        (
+                            title.strip(),
+                            trigger_intent.strip(),
+                            precond_json,
+                            steps_json,
+                            expected_outcome.strip(),
+                            verification_method,
+                            fail_json,
+                            confidence,
+                            1 if verified else 0,
+                            now,
+                            proc_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO procedures (
+                            id, title, trigger_intent, preconditions, steps,
+                            expected_outcome, verification_method, failure_modes,
+                            confidence, verified, success_count, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            proc_id,
+                            title.strip(),
+                            trigger_intent.strip(),
+                            precond_json,
+                            steps_json,
+                            expected_outcome.strip(),
+                            verification_method,
+                            fail_json,
+                            confidence,
+                            1 if verified else 0,
+                            0,
+                            now,
+                            now,
+                        ),
+                    )
+
+            # Also create/update a procedural memory entry in memories table so it is searchable via FTS5
+            content = f"Procedure: {title}. Trigger: {trigger_intent}. Steps: {'; '.join(steps)}"
+            self.remember(
+                content=content,
+                category="procedure",
+                layer="procedural",
+                subject=trigger_intent,
+                predicate="workflow",
+                tags=["procedure", trigger_intent],
+            )
+
+            return {
+                "id": proc_id,
+                "title": title,
+                "trigger_intent": trigger_intent,
+                "steps": steps,
+                "expected_outcome": expected_outcome,
+                "verified": verified,
+            }
+
+    def recall_procedures(self, query: str, limit: int = 3) -> List[Dict[str, Any]]:
+        """Recalls procedures matching intent, title, or keywords."""
+        with self._lock:
+            q = query.strip().lower()
+            with self.db_manager.connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM procedures
+                    WHERE lower(trigger_intent) LIKE ? OR lower(title) LIKE ?
+                    ORDER BY verified DESC, success_count DESC, confidence DESC
+                    LIMIT ?;
+                    """,
+                    (f"%{q}%", f"%{q}%", limit),
+                ).fetchall()
+                results = []
+                for r in rows:
+                    item = dict(r)
+                    item["preconditions"] = json.loads(item["preconditions"])
+                    item["steps"] = json.loads(item["steps"])
+                    item["failure_modes"] = json.loads(item["failure_modes"])
+                    results.append(item)
+                return results
+
+    def record_procedure_result(self, proc_id: str, success: bool):
+        """Records the outcome of executing a procedure, updating success metrics."""
+        with self._lock:
+            now = datetime.now(timezone.utc).isoformat()
+            with self.db_manager.connection() as conn:
+                if success:
+                    conn.execute(
+                        """
+                        UPDATE procedures
+                        SET success_count = success_count + 1, verified = 1, last_executed = ?, updated_at = ?
+                        WHERE id = ?;
+                        """,
+                        (now, now, proc_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE procedures
+                        SET confidence = max(0.1, confidence - 0.1), last_executed = ?, updated_at = ?
+                        WHERE id = ?;
+                        """,
+                        (now, now, proc_id),
+                    )
+
     def get_context_summary(
         self,
         max_items: int = 5,
